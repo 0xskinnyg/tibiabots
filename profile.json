@@ -1,13 +1,13 @@
 {
   "mana_threshold_percent": 80.0,
   "mana_point": [
-    1376,
-    238
+    1375,
+    240
   ],
   "mana_color": [
-    67,
-    66,
-    116
+    39,
+    39,
+    53
   ],
   "mana_color_tolerance": 35,
   "logout_color": [
@@ -20,6 +20,7 @@
     78
   ],
   "logout_tolerance": 35,
+  "mouse_speed": 1.0,
   "slot_width": 34,
   "slot_height": 34,
   "start_slot": 1,

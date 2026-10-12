@@ -55,7 +55,6 @@ class MacroRecorder:
         self.last_event_time: float | None = None
         self.last_move_time: float | None = None
         self.playback_error: str | None = None
-        self.last_logout_press = 0.0
         self.automation_running = False
         self.automation_stop = threading.Event()
         self.background_pause = threading.Event()
@@ -70,9 +69,6 @@ class MacroRecorder:
             "mana_point": None,
             "mana_color": None,
             "mana_color_tolerance": 35,
-            "logout_color": None,
-            "logout_point": None,
-            "logout_tolerance": 35,
             "slot_width": 34,
             "slot_height": 34,
             "start_slot": 1,
@@ -166,7 +162,6 @@ class MacroRecorder:
             ("Set fish slot", lambda: self.calibrate_point("fish_slot")),
             ("Set mana check point", lambda: self.calibrate_point("mana_point")),
             ("Capture mana color", self.calibrate_mana_color),
-            ("Capture logout color", self.calibrate_logout_color),
         ]
         for index, (label, command) in enumerate(other_calibration_buttons):
             ttk.Button(calibration, text=label, command=command).grid(row=2 + index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=2)
@@ -237,30 +232,6 @@ class MacroRecorder:
             return Key[data["value"]]
         return KeyCode(char=data["value"])
 
-    @staticmethod
-    def _interpolate_move(start: tuple[int, int], end: tuple[int, int], max_step: int = 3) -> list[tuple[int, int]]:
-        start_x, start_y = start
-        end_x, end_y = end
-        dx = end_x - start_x
-        dy = end_y - start_y
-        distance = max(abs(dx), abs(dy), 1)
-        if distance <= max_step:
-            return [end]
-        steps = max(2, int(distance // max_step) + 1)
-        return [
-            (
-                round(start_x + dx * step / steps),
-                round(start_y + dy * step / steps),
-            )
-            for step in range(1, steps + 1)
-        ]
-
-    def _move_mouse_smoothly(self, target_x: int, target_y: int) -> None:
-        start_x, start_y = map(int, self.mouse_controller.position)
-        for x, y in self._interpolate_move((start_x, start_y), (target_x, target_y), max_step=3):
-            self.mouse_controller.position = (x, y)
-            time.sleep(0.02)
-
     def toggle_recording(self) -> None:
         if self.playing:
             return
@@ -295,11 +266,9 @@ class MacroRecorder:
                 for recorded_event in self.events:
                     if self.stop_playback.wait(recorded_event["delay"]):
                         return
-                    if self._maybe_press_enter_after_logout():
-                        continue
                     kind = recorded_event["type"]
                     if kind == "move":
-                        self._move_mouse_smoothly(recorded_event["x"], recorded_event["y"])
+                        self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
                     elif kind == "click":
                         self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
                         button = Button[recorded_event["button"]]
@@ -409,9 +378,7 @@ class MacroRecorder:
         )
         if not filename:
             return
-        profile_data = dict(self.profile)
-        profile_data["backpack_names"] = list(self.backpack_names)
-        Path(filename).write_text(json.dumps(profile_data, indent=2), encoding="utf-8")
+        Path(filename).write_text(json.dumps(self.profile, indent=2), encoding="utf-8")
         self.status.set(f"Saved profile: {Path(filename).name}")
 
     def load_profile(self) -> None:
@@ -425,24 +392,13 @@ class MacroRecorder:
             data = json.loads(Path(filename).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("profile must be a JSON object")
-            saved_backpacks = data.get("backpack_names")
-            if isinstance(saved_backpacks, list):
-                discovered = sorted(
-                    (str(name) for name in saved_backpacks if re.fullmatch(r"bp\d+", str(name))),
-                    key=lambda key: int(key[2:]),
-                )
-                self.backpack_names = discovered or ["bp1", "bp2"]
-            else:
-                discovered = sorted(
-                    (key for key in data if re.fullmatch(r"bp\d+", key)),
-                    key=lambda key: int(key[2:]),
-                )
-                self.backpack_names = discovered or ["bp1", "bp2"]
             self.profile.update(data)
-            self.profile.pop("backpack_names", None)
+            discovered = sorted(
+                (key for key in self.profile if re.fullmatch(r"bp\d+", key)),
+                key=lambda key: int(key[2:]),
+            )
+            self.backpack_names = discovered or ["bp1", "bp2"]
             for name in ("bp1", "bp2"):
-                self.profile.setdefault(name, {"first_slot": None, "rows": 4, "columns": 5})
-            for name in self.backpack_names:
                 self.profile.setdefault(name, {"first_slot": None, "rows": 4, "columns": 5})
             self._rebuild_backpack_buttons()
             self.threshold_var.set(str(self.profile.get("mana_threshold_percent", 80)))
@@ -460,17 +416,6 @@ class MacroRecorder:
         if not 0 <= threshold <= 100:
             raise ValueError("Mana threshold must be between 0 and 100")
         self.profile["mana_threshold_percent"] = threshold
-
-        slot_value = (self.slot_size_var.get() or "34 x 34").strip()
-        try:
-            width_text, height_text = re.split(r"[xX]", slot_value, maxsplit=1)
-            width = int(float(width_text.strip()))
-            height = int(float(height_text.strip()))
-        except (TypeError, ValueError):
-            raise ValueError("Slot size must be in the form '34 x 34'") from None
-        self.profile["slot_width"] = width
-        self.profile["slot_height"] = height
-        self.profile["backpack_names"] = list(self.backpack_names)
 
     def calibrate_point(self, target: str) -> None:
         self.status.set(f"Move the cursor to {target.replace('_', ' ')}… capturing in 2 seconds")
@@ -535,71 +480,6 @@ class MacroRecorder:
         self.status.set(f"Mana color captured: {tuple(self.profile['mana_color'])}")
         self._update_profile_status()
 
-    def calibrate_logout_color(self) -> None:
-        self.status.set("Move the cursor onto the logged-out screen color… capturing in 2 seconds")
-        self.root.after(2000, self._capture_logout_color)
-
-    def _capture_logout_color(self) -> None:
-        if ImageGrab is None:
-            messagebox.showerror("Logout color", "Install Pillow first: pip install Pillow")
-            return
-        x, y = [int(round(value)) for value in self.mouse_controller.position]
-        try:
-            sample = ImageGrab.grab(bbox=(x, y, x + 3, y + 3)).convert("RGB")
-        except Exception as error:
-            messagebox.showerror(
-                "Logout color",
-                "Could not capture the screen at that position. "
-                "Check Screen Recording permission for Python/Terminal, then retry.\n\n"
-                f"{type(error).__name__}: {error}",
-            )
-            return
-        pixels = list(sample.getdata())
-        self.profile["logout_color"] = [
-            round(sum(pixel[0] for pixel in pixels) / len(pixels)),
-            round(sum(pixel[1] for pixel in pixels) / len(pixels)),
-            round(sum(pixel[2] for pixel in pixels) / len(pixels)),
-        ]
-        self.profile["logout_point"] = [x, y]
-        self.status.set(f"Logout color captured: {tuple(self.profile['logout_color'])}")
-        self._update_profile_status()
-
-    @staticmethod
-    def _color_matches(sample: tuple[int, int, int] | list[int] | None, target: tuple[int, int, int] | list[int] | None, tolerance: float = 35.0) -> bool:
-        if sample is None or target is None:
-            return False
-        try:
-            red, green, blue = map(int, sample)
-            target_red, target_green, target_blue = map(int, target)
-        except (TypeError, ValueError):
-            return False
-        distance = ((red - target_red) ** 2 + (green - target_green) ** 2 + (blue - target_blue) ** 2) ** 0.5
-        return distance <= tolerance
-
-    def _maybe_press_enter_after_logout(self) -> bool:
-        if not self.profile.get("logout_color"):
-            return False
-        point = self.profile.get("logout_point")
-        if point is None:
-            return False
-        x, y = map(int, point)
-        try:
-            image = ImageGrab.grab(bbox=(x, y, x + 1, y + 1)).convert("RGB")
-        except Exception:
-            return False
-        color = next(iter(image.getdata()))
-        tolerance = float(self.profile.get("logout_tolerance", 35))
-        if not self._color_matches(color, self.profile["logout_color"], tolerance):
-            return False
-        now = time.monotonic()
-        if now - self.last_logout_press < 5.0:
-            return False
-        self.last_logout_press = now
-        self.keyboard_controller.press(Key.enter)
-        self.keyboard_controller.release(Key.enter)
-        self.root.after(0, lambda: self.status.set("Server-save login detected; pressed Enter"))
-        return True
-
     def _update_profile_status(self) -> None:
         missing = []
         for name in self.backpack_names:
@@ -611,8 +491,6 @@ class MacroRecorder:
             missing.append("mana point")
         if not self.profile.get("mana_color"):
             missing.append("mana color")
-        if not self.profile.get("logout_color"):
-            missing.append("logout color")
         self.profile_status.set("Ready" if not missing else "Calibrate: " + ", ".join(missing))
 
     # ------------------------------------------------------------------
@@ -669,10 +547,6 @@ class MacroRecorder:
             while not self.automation_stop.is_set():
                 mana = self._read_mana_percent()
                 threshold = float(self.profile["mana_threshold_percent"])
-                if self._maybe_press_enter_after_logout():
-                    if self.automation_stop.wait(0.2):
-                        break
-                    continue
                 if mana >= threshold:
                     self.background_pause.set()
                     self.release_stuck_inputs()
@@ -700,8 +574,10 @@ class MacroRecorder:
             for recorded_event in self.events:
                 if self.automation_stop.is_set():
                     return
-                    if self._maybe_press_enter_after_logout():
-                        continue
+                while self.background_pause.is_set() and not self.automation_stop.is_set():
+                    time.sleep(0.05)
+                remaining = float(recorded_event.get("delay", 0.0))
+                while remaining > 0 and not self.automation_stop.is_set():
                     if self.background_pause.is_set():
                         time.sleep(0.05)
                         continue
@@ -714,7 +590,7 @@ class MacroRecorder:
     def _perform_event(self, recorded_event: dict[str, Any]) -> None:
         kind = recorded_event["type"]
         if kind == "move":
-            self._move_mouse_smoothly(recorded_event["x"], recorded_event["y"])
+            self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
         elif kind == "click":
             self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
             button = Button[recorded_event["button"]]
