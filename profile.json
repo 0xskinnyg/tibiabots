@@ -1,0 +1,66 @@
+{
+  "mana_threshold_percent": 80.0,
+  "mana_point": [
+    1376,
+    238
+  ],
+  "mana_color": [
+    67,
+    66,
+    116
+  ],
+  "mana_color_tolerance": 35,
+  "logout_color": [
+    37,
+    31,
+    32
+  ],
+  "logout_point": [
+    390,
+    78
+  ],
+  "logout_tolerance": 35,
+  "slot_width": 34,
+  "slot_height": 34,
+  "start_slot": 1,
+  "bp1": {
+    "first_slot": [
+      1101,
+      98
+    ],
+    "rows": 4,
+    "columns": 5
+  },
+  "bp2": {
+    "first_slot": [
+      1099,
+      259
+    ],
+    "rows": 4,
+    "columns": 5
+  },
+  "left_hand": [
+    1303,
+    317
+  ],
+  "fish_slot": [
+    1294,
+    553
+  ],
+  "cast_key": "f5",
+  "cast_delay": 1.0,
+  "mana_region": null,
+  "bp3": {
+    "first_slot": [
+      1100,
+      411
+    ],
+    "rows": 4,
+    "columns": 5
+  },
+  "backpack_names": [
+    "bp1",
+    "bp2",
+    "bp3"
+  ]
+}
