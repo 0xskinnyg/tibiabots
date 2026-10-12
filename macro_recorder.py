@@ -2,6 +2,10 @@
 """A small cross-app mouse and keyboard macro recorder for macOS.
 
 Global hotkeys:
+    F1   set mana check point
+    F2   capture mana color
+    F6   set BP1 first slot
+    F7   set BP2 first slot
     F8   start/stop recording
     F9   replay the recorded macro
     F10  clear the recording
@@ -138,7 +142,7 @@ class MacroRecorder:
         self.events_view.pack(fill="both", expand=True, pady=(10, 12))
         ttk.Label(
             frame,
-            text="F8 record/stop   •   F9 replay   •   F10 clear   •   F11 stop",
+            text="F1 mana point   •   F2 mana color   •   F6 BP1   •   F7 BP2   •   F8 record/stop   •   F9 replay   •   F10 clear   •   F11 stop",
             foreground="#666666",
         ).pack(anchor="w")
 
@@ -193,6 +197,12 @@ class MacroRecorder:
         self._record_event({"type": "scroll", "x": x, "y": y, "dx": dx, "dy": dy})
 
     def _on_press(self, key: Key | KeyCode) -> None:
+        if key == Key.f1:
+            self.root.after(0, lambda: self.calibrate_point("mana_point"))
+            return
+        if key == Key.f2:
+            self.root.after(0, self.calibrate_mana_color)
+            return
         if key == Key.f6:
             self.root.after(0, lambda: self.calibrate_point("bp1"))
             return
@@ -215,7 +225,7 @@ class MacroRecorder:
             self._record_event({"type": "key_down", "key": self._serialize_key(key)})
 
     def _on_release(self, key: Key | KeyCode) -> None:
-        if key in (Key.f6, Key.f7, Key.f8, Key.f9, Key.f10, Key.f11):
+        if key in (Key.f1, Key.f2, Key.f6, Key.f7, Key.f8, Key.f9, Key.f10, Key.f11):
             return
         if self.recording and not self.playing:
             self._record_event({"type": "key_up", "key": self._serialize_key(key)})
@@ -418,8 +428,8 @@ class MacroRecorder:
         self.profile["mana_threshold_percent"] = threshold
 
     def calibrate_point(self, target: str) -> None:
-        self.status.set(f"Move the cursor to {target.replace('_', ' ')}… capturing in 2 seconds")
-        self.root.after(2000, lambda: self._capture_point(target))
+        self.status.set(f"Capturing {target.replace('_', ' ')} from the current cursor position")
+        self._capture_point(target)
 
     def _capture_point(self, target: str) -> None:
         point = [int(round(value)) for value in self.mouse_controller.position]
@@ -453,8 +463,8 @@ class MacroRecorder:
         self.status.set(f"Added {name.upper()}; calibrate its first slot")
 
     def calibrate_mana_color(self) -> None:
-        self.status.set("Move the cursor onto the filled mana color… capturing in 2 seconds")
-        self.root.after(2000, self._capture_mana_color)
+        self.status.set("Capturing the exact filled-mana pixel under the cursor")
+        self._capture_mana_color()
 
     def _capture_mana_color(self) -> None:
         if ImageGrab is None:
@@ -462,7 +472,7 @@ class MacroRecorder:
             return
         x, y = [int(round(value)) for value in self.mouse_controller.position]
         try:
-            sample = ImageGrab.grab(bbox=(x, y, x + 3, y + 3)).convert("RGB")
+            sample = ImageGrab.grab(bbox=(x, y, x + 1, y + 1)).convert("RGB")
         except Exception as error:
             messagebox.showerror(
                 "Mana color",
@@ -471,12 +481,7 @@ class MacroRecorder:
                 f"{type(error).__name__}: {error}",
             )
             return
-        pixels = list(sample.getdata())
-        self.profile["mana_color"] = [
-            round(sum(pixel[0] for pixel in pixels) / len(pixels)),
-            round(sum(pixel[1] for pixel in pixels) / len(pixels)),
-            round(sum(pixel[2] for pixel in pixels) / len(pixels)),
-        ]
+        self.profile["mana_color"] = list(next(iter(sample.getdata())))
         self.status.set(f"Mana color captured: {tuple(self.profile['mana_color'])}")
         self._update_profile_status()
 
@@ -532,7 +537,7 @@ class MacroRecorder:
             return
         try:
             value = self._read_mana_percent()
-            self.status.set(f"Mana point test: {'FILLED' if value >= 80 else 'not filled'} ({value:.0f}%)")
+            self.status.set(f"Mana point test: {'FILLED' if value >= 100.0 else 'not filled'} ({value:.0f}%)")
         except Exception as error:
             messagebox.showerror("Mana test", str(error))
 
@@ -546,8 +551,7 @@ class MacroRecorder:
         try:
             while not self.automation_stop.is_set():
                 mana = self._read_mana_percent()
-                threshold = float(self.profile["mana_threshold_percent"])
-                if mana >= threshold:
+                if mana >= 100.0:
                     self.background_pause.set()
                     self.release_stuck_inputs()
                     if not self._rune_once():
@@ -558,7 +562,7 @@ class MacroRecorder:
                         break
                 else:
                     self.background_pause.clear()
-                    self.root.after(0, lambda value=mana: self.status.set(f"Waiting: mana {value:.0f}% / {threshold:.0f}%"))
+                    self.root.after(0, lambda value=mana: self.status.set(f"Waiting: mana {value:.0f}%"))
                     if self.automation_stop.wait(0.35):
                         break
         except Exception as error:
@@ -641,11 +645,11 @@ class MacroRecorder:
             image = ImageGrab.grab(bbox=(x, y, x + 1, y + 1)).convert("RGB")
         except Exception as error:
             raise RuntimeError("Screen capture failed; enable Screen Recording permission for Python/Terminal") from error
-        target_red, target_green, target_blue = self.profile["mana_color"]
-        tolerance = float(self.profile.get("mana_color_tolerance", 35))
-        red, green, blue = next(iter(image.getdata()))
-        distance = ((red - target_red) ** 2 + (green - target_green) ** 2 + (blue - target_blue) ** 2) ** 0.5
-        return 100.0 if distance <= tolerance else 0.0
+        if not self.profile.get("mana_color"):
+            raise RuntimeError("Mana color is not calibrated")
+        current_color = tuple(next(iter(image.getdata())))
+        target_color = tuple(self.profile["mana_color"])
+        return 100.0 if current_color == target_color else 0.0
 
     def _rune_once(self) -> bool:
         # Ctrl can be held by the fishing/eating recording. Release it before
