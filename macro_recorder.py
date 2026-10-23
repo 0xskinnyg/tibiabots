@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import fcntl
 from pathlib import Path
@@ -57,8 +58,8 @@ class MacroRecorder:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Macro Recorder")
-        self.root.geometry("820x800")
-        self.root.minsize(720, 700)
+        self.root.geometry("820x760")
+        self.root.minsize(520, 420)
 
         self.mouse_controller = mouse.Controller()
         self.keyboard_controller = keyboard.Controller()
@@ -72,6 +73,7 @@ class MacroRecorder:
         self.last_move_time: float | None = None
         self.playback_error: str | None = None
         self.automation_running = False
+        self.automation_timed_runes = False
         self.automation_stop = threading.Event()
         self.background_pause = threading.Event()
         self.background_thread: threading.Thread | None = None
@@ -111,6 +113,11 @@ class MacroRecorder:
         self.background_enabled = tk.BooleanVar(value=False)
         self.background_target_var = tk.StringVar(value="Foreground input")
         self.focus_interval_var = tk.StringVar(value="10")
+        self.recording_loop_interval_var = tk.StringVar(value="0")
+        self.timed_runes_var = tk.BooleanVar(value=False)
+        self.rune_interval_var = tk.StringVar(value="60")
+        self.recording_loop_interval = 0.0
+        self.rune_interval = 60.0
 
         self.status = tk.StringVar(value="Ready")
         self.event_count = tk.StringVar(value="0 events")
@@ -131,8 +138,32 @@ class MacroRecorder:
         self._refresh_background_targets()
 
     def _build_ui(self) -> None:
-        frame = ttk.Frame(self.root, padding=18)
-        frame.pack(fill="both", expand=True)
+        shell = ttk.Frame(self.root)
+        shell.grid(row=0, column=0, sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(0, weight=1)
+
+        self.ui_canvas = tk.Canvas(shell, highlightthickness=0)
+        vertical_scrollbar = ttk.Scrollbar(shell, orient="vertical", command=self.ui_canvas.yview)
+        horizontal_scrollbar = ttk.Scrollbar(shell, orient="horizontal", command=self.ui_canvas.xview)
+        self.ui_canvas.configure(
+            yscrollcommand=vertical_scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
+        self.ui_canvas.grid(row=0, column=0, sticky="nsew")
+        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        frame = ttk.Frame(self.ui_canvas, padding=18)
+        self.ui_content_frame = frame
+        self.ui_content_window = self.ui_canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", self._update_ui_scroll_region)
+        self.ui_canvas.bind("<Configure>", self._resize_ui_content)
+        self.root.bind_all("<MouseWheel>", self._scroll_ui_with_wheel)
+        self.root.bind_all("<Button-4>", lambda _event: self.ui_canvas.yview_scroll(-1, "units"))
+        self.root.bind_all("<Button-5>", lambda _event: self.ui_canvas.yview_scroll(1, "units"))
 
         ttk.Label(frame, text="Macro Recorder", font=(".AppleSystemUIFont", 20, "bold")).pack(anchor="w")
         ttk.Label(
@@ -149,6 +180,7 @@ class MacroRecorder:
         self.stop_button = ttk.Button(controls, text="■  Stop (F11)", command=self.stop)
         self.stop_button.pack(side="left", padx=(0, 8))
         ttk.Button(controls, text="Clear (F10)", command=self.clear).pack(side="left")
+        ttk.Button(controls, text="Restart to load code", command=self.restart_program).pack(side="right")
 
         files = ttk.Frame(frame)
         files.pack(fill="x", pady=(10, 0))
@@ -178,9 +210,26 @@ class MacroRecorder:
         ttk.Label(automation, textvariable=self.slot_size_var).grid(row=0, column=2, sticky="w")
         ttk.Button(automation, text="Start automation", command=self.start_automation).grid(row=0, column=3, padx=(12, 5))
         ttk.Button(automation, text="Stop automation", command=self.stop_automation).grid(row=0, column=4)
-        ttk.Checkbutton(automation, text="Loop loaded fishing/eating recording while waiting", variable=self.background_enabled).grid(row=1, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        rune_timer_row = ttk.Frame(automation)
+        rune_timer_row.grid(row=1, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            rune_timer_row,
+            text="Use timer instead of mana pixel",
+            variable=self.timed_runes_var,
+        ).pack(side="left")
+        ttk.Label(rune_timer_row, text="Rune interval (sec):").pack(side="left", padx=(12, 4))
+        ttk.Entry(rune_timer_row, width=7, textvariable=self.rune_interval_var).pack(side="left")
+        loop_row = ttk.Frame(automation)
+        loop_row.grid(row=2, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(
+            loop_row,
+            text="Loop loaded fishing/eating recording while waiting",
+            variable=self.background_enabled,
+        ).pack(side="left")
+        ttk.Label(loop_row, text="Pause between loops (sec):").pack(side="left", padx=(12, 4))
+        ttk.Entry(loop_row, width=6, textvariable=self.recording_loop_interval_var).pack(side="left")
         target_row = ttk.Frame(automation)
-        target_row.grid(row=2, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        target_row.grid(row=3, column=0, columnspan=5, sticky="w", pady=(7, 0))
         ttk.Label(target_row, text="Window to focus:").pack(side="left")
         self.background_target_menu = ttk.Combobox(
             target_row,
@@ -197,10 +246,10 @@ class MacroRecorder:
             automation,
             text="Selected window receives normal foreground mouse and keyboard input.",
             foreground="#666666",
-        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         calibration = ttk.Frame(automation)
-        calibration.grid(row=4, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        calibration.grid(row=5, column=0, columnspan=5, sticky="w", pady=(10, 0))
         self.backpack_calibration_frame = ttk.Frame(calibration)
         self.backpack_calibration_frame.grid(row=0, column=0, columnspan=2, sticky="w")
         self._rebuild_backpack_buttons()
@@ -213,9 +262,44 @@ class MacroRecorder:
         ]
         for index, (label, command) in enumerate(other_calibration_buttons):
             ttk.Button(calibration, text=label, command=command).grid(row=2 + index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=2)
-        ttk.Label(automation, textvariable=self.profile_status, foreground="#666666").grid(row=5, column=0, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Button(automation, text="Test mana point", command=self.test_mana_point).grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(automation, text="Reset held keys", command=self.release_stuck_inputs).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(automation, textvariable=self.profile_status, foreground="#666666").grid(row=6, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Button(automation, text="Test mana point", command=self.test_mana_point).grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(automation, text="Reset held keys", command=self.release_stuck_inputs).grid(row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+    def _update_ui_scroll_region(self, _event: Any = None) -> None:
+        self.ui_canvas.configure(scrollregion=self.ui_canvas.bbox("all"))
+
+    def _resize_ui_content(self, event: Any) -> None:
+        self.ui_canvas.itemconfigure(
+            self.ui_content_window,
+            width=max(event.width, self.ui_content_frame.winfo_reqwidth()),
+        )
+        self._update_ui_scroll_region()
+
+    def _scroll_ui_with_wheel(self, event: Any) -> str:
+        amount = -1 if event.delta > 0 else 1
+        if event.state & 0x0001:
+            self.ui_canvas.xview_scroll(amount, "units")
+        else:
+            self.ui_canvas.yview_scroll(amount, "units")
+        return "break"
+
+    def restart_program(self) -> None:
+        if not messagebox.askyesno(
+            "Restart to load code",
+            "Restart the program now? Any unsaved recording or profile changes will be lost.",
+        ):
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, *sys.argv],
+                cwd=Path.cwd(),
+                close_fds=True,
+            )
+        except OSError as error:
+            messagebox.showerror("Restart failed", str(error))
+            return
+        self.close()
 
     def _refresh_background_targets(self) -> None:
         if Quartz is None:
@@ -278,10 +362,10 @@ class MacroRecorder:
             'tell application "System Events"\n'
             f"set targetProcess to first application process whose unix id is {pid}\n"
             "set frontmost of targetProcess to true\n"
-            "try\n"
             f'set targetWindow to first window of targetProcess whose name is "{escaped_title}"\n'
             'perform action "AXRaise" of targetWindow\n'
-            "end try\n"
+            'set value of attribute "AXMain" of targetWindow to true\n'
+            'if frontmost of targetProcess is false then error "Target process did not become frontmost"\n'
             "end tell"
         )
         try:
@@ -594,6 +678,7 @@ class MacroRecorder:
         self.stop()
         self.mouse_listener.stop()
         self.keyboard_listener.stop()
+        self.focus_lock_file.close()
         self.root.destroy()
 
     # ------------------------------------------------------------------
@@ -766,28 +851,39 @@ class MacroRecorder:
     def start_automation(self) -> None:
         if self.recording or self.playing or self.automation_running:
             return
+        timed_runes = self.timed_runes_var.get()
         target = self._selected_background_target()
-        if target is None and ImageGrab is None:
+        if not timed_runes and target is None and ImageGrab is None:
             messagebox.showerror("Rune automation", "Install Pillow first: pip install Pillow")
             return
-        if target is not None and (Quartz is None or Image is None):
-            messagebox.showerror("Rune automation", "Window focusing requires macOS Quartz and Pillow")
+        if target is not None and (Quartz is None or (not timed_runes and Image is None)):
+            messagebox.showerror("Rune automation", "Window targeting requires macOS Quartz and Pillow")
             return
         try:
             self._read_profile_fields()
             focus_interval = float(self.focus_interval_var.get())
             if not 1 <= focus_interval <= 3600:
                 raise ValueError("Refocus interval must be between 1 and 3600 seconds")
+            loop_interval = self._read_recording_loop_interval()
+            rune_interval = self._read_rune_interval() if timed_runes else 0.0
         except ValueError as error:
             messagebox.showerror("Rune automation", str(error))
             return
         required = [self.profile[name].get("first_slot") for name in self.backpack_names]
-        required.extend([self.profile.get("left_hand"), self.profile.get("mana_point"), self.profile.get("mana_color")])
+        required.append(self.profile.get("left_hand"))
+        if not timed_runes:
+            required.extend([self.profile.get("mana_point"), self.profile.get("mana_color")])
         if any(value is None for value in required):
-            messagebox.showwarning("Rune automation", "Calibrate every backpack, the left hand, mana point, and mana color first.")
+            calibration = "every backpack and the left hand"
+            if not timed_runes:
+                calibration += ", mana point, and mana color"
+            messagebox.showwarning("Rune automation", f"Calibrate {calibration} first.")
             return
         self.automation_target_pid, self.automation_target_window_id = target or (None, None)
         self.automation_focus_interval = focus_interval
+        self.recording_loop_interval = loop_interval
+        self.automation_timed_runes = timed_runes
+        self.rune_interval = rune_interval
         self.last_focus_time = 0.0
         if target is not None:
             try:
@@ -807,6 +903,24 @@ class MacroRecorder:
             self.background_thread = threading.Thread(target=self._background_loop, daemon=True)
             self.background_thread.start()
         threading.Thread(target=self._automation_loop, daemon=True).start()
+
+    def _read_recording_loop_interval(self) -> float:
+        try:
+            interval = float(self.recording_loop_interval_var.get())
+        except ValueError as error:
+            raise ValueError("Recording loop interval must be a number") from error
+        if not 0 <= interval <= 3600:
+            raise ValueError("Recording loop interval must be between 0 and 3600 seconds")
+        return interval
+
+    def _read_rune_interval(self) -> float:
+        try:
+            interval = float(self.rune_interval_var.get())
+        except ValueError as error:
+            raise ValueError("Rune interval must be a number") from error
+        if not 1 <= interval <= 86400:
+            raise ValueError("Rune interval must be between 1 and 86400 seconds")
+        return interval
 
     def test_mana_point(self) -> None:
         if ImageGrab is None and (self._selected_background_target() is None or Image is None):
@@ -829,6 +943,9 @@ class MacroRecorder:
 
     def _automation_loop(self) -> None:
         try:
+            if self.automation_timed_runes:
+                self._timed_automation_loop()
+                return
             while not self.automation_stop.is_set():
                 self._focus_target_if_due()
                 mana = self._read_mana_percent()
@@ -852,6 +969,34 @@ class MacroRecorder:
             self.automation_running = False
             self.background_pause.set()
             self.root.after(0, lambda: self.status.set("Automation stopped"))
+
+    def _timed_automation_loop(self) -> None:
+        while not self.automation_stop.is_set():
+            self.root.after(
+                0,
+                lambda interval=self.rune_interval: self.status.set(
+                    f"Next rune in {interval:g} seconds"
+                ),
+            )
+            if not self._wait_for_next_rune():
+                return
+            self.background_pause.set()
+            self.release_stuck_inputs()
+            if not self._rune_once():
+                self.automation_stop.set()
+                return
+            self.root.after(0, lambda: self.status.set("Rune made (timer mode)"))
+            self.background_pause.clear()
+
+    def _wait_for_next_rune(self) -> bool:
+        remaining = self.rune_interval
+        while remaining > 0 and not self.automation_stop.is_set():
+            self._focus_target_if_due()
+            wait_interval = min(0.25, remaining)
+            if self.automation_stop.wait(wait_interval):
+                return False
+            remaining -= wait_interval
+        return not self.automation_stop.is_set()
 
     def _background_loop(self) -> None:
         """Loop a separately recorded fishing/eating macro while mana is low."""
@@ -884,9 +1029,24 @@ class MacroRecorder:
                         and not self.automation_stop.is_set()
                     ):
                         self._perform_event(recorded_event)
+                self._wait_recording_loop_interval()
         finally:
             if self.background_held_buttons or self.background_held_keys:
                 self.release_stuck_inputs()
+
+    def _wait_recording_loop_interval(self) -> None:
+        remaining = self.recording_loop_interval
+        while remaining > 0 and not self.automation_stop.is_set():
+            if (
+                self.background_pause.is_set()
+                and not self.background_held_buttons
+                and not self.background_held_keys
+            ):
+                time.sleep(0.05)
+                continue
+            pause = min(remaining, 0.05)
+            time.sleep(pause)
+            remaining -= pause
 
     def _perform_event(self, recorded_event: dict[str, Any]) -> None:
         kind = recorded_event["type"]

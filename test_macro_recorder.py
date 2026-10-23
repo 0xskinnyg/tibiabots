@@ -98,6 +98,111 @@ class MacroRecorderColorTests(unittest.TestCase):
 
 
 class MacroRecorderAutomationTests(unittest.TestCase):
+    def test_rune_interval_accepts_positive_seconds_and_rejects_invalid_values(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.rune_interval_var = SimpleNamespace(get=lambda: "45.5")
+        self.assertEqual(recorder._read_rune_interval(), 45.5)
+
+        for value in ("", "0", "-1", "86401", "invalid"):
+            with self.subTest(value=value):
+                recorder.rune_interval_var = SimpleNamespace(get=lambda: value)
+                with self.assertRaises(ValueError):
+                    recorder._read_rune_interval()
+
+    def test_timed_automation_casts_on_interval_without_reading_mana(self):
+        statuses = []
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.automation_stop = threading.Event()
+        recorder.rune_interval = 0.25
+        recorder.background_pause = threading.Event()
+        recorder.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        recorder.status = SimpleNamespace(set=statuses.append)
+        recorder._focus_target_if_due = Mock()
+        recorder.release_stuck_inputs = Mock()
+        recorder._rune_once = Mock(return_value=True)
+        recorder._read_mana_percent = Mock(side_effect=AssertionError("mana should not be sampled"))
+
+        with patch.object(recorder.automation_stop, "wait", side_effect=[False, True]) as wait:
+            recorder._timed_automation_loop()
+
+        self.assertEqual(wait.call_args_list, [unittest.mock.call(0.25), unittest.mock.call(0.25)])
+        self.assertEqual(recorder._focus_target_if_due.call_count, 2)
+        recorder._rune_once.assert_called_once()
+        recorder._read_mana_percent.assert_not_called()
+        self.assertEqual(statuses, ["Next rune in 0.25 seconds", "Rune made (timer mode)", "Next rune in 0.25 seconds"])
+        self.assertFalse(recorder.background_pause.is_set())
+
+    def test_timed_rune_wait_refocuses_during_long_interval(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.rune_interval = 1
+        recorder.automation_stop = threading.Event()
+        recorder._focus_target_if_due = Mock()
+
+        with patch.object(recorder.automation_stop, "wait", side_effect=[False, False, False, True]) as wait:
+            completed = recorder._wait_for_next_rune()
+
+        self.assertFalse(completed)
+        self.assertEqual(wait.call_args_list, [unittest.mock.call(0.25)] * 4)
+        self.assertEqual(recorder._focus_target_if_due.call_count, 4)
+
+    def test_recording_loop_interval_accepts_zero_and_positive_seconds(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.recording_loop_interval_var = SimpleNamespace(get=lambda: "2.5")
+        self.assertEqual(recorder._read_recording_loop_interval(), 2.5)
+
+        recorder.recording_loop_interval_var = SimpleNamespace(get=lambda: "0")
+        self.assertEqual(recorder._read_recording_loop_interval(), 0)
+
+    def test_recording_loop_interval_rejects_invalid_or_too_large_values(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        for value in ("", "abc", "-1", "3601"):
+            with self.subTest(value=value):
+                recorder.recording_loop_interval_var = SimpleNamespace(get=lambda: value)
+                with self.assertRaises(ValueError):
+                    recorder._read_recording_loop_interval()
+
+    def test_recording_loop_wait_uses_configured_interval(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.recording_loop_interval = 0.1
+        recorder.automation_stop = threading.Event()
+        recorder.background_pause = threading.Event()
+        recorder.background_held_buttons = set()
+        recorder.background_held_keys = set()
+        pauses = []
+
+        with patch("macro_recorder.time.sleep", side_effect=pauses.append):
+            recorder._wait_recording_loop_interval()
+
+        self.assertEqual(pauses, [0.05, 0.05])
+
+    def test_mouse_wheel_scrolls_vertically_and_shift_wheel_horizontally(self):
+        calls = []
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.ui_canvas = SimpleNamespace(
+            xview_scroll=lambda amount, units: calls.append(("x", amount, units)),
+            yview_scroll=lambda amount, units: calls.append(("y", amount, units)),
+        )
+
+        recorder._scroll_ui_with_wheel(SimpleNamespace(delta=120, state=0))
+        recorder._scroll_ui_with_wheel(SimpleNamespace(delta=-120, state=1))
+
+        self.assertEqual(calls, [("y", -1, "units"), ("x", 1, "units")])
+
+    def test_restart_launches_current_python_and_script(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.close = Mock()
+
+        with patch.object(macro_recorder.messagebox, "askyesno", return_value=True):
+            with patch.object(macro_recorder.subprocess, "Popen") as popen:
+                recorder.restart_program()
+
+        popen.assert_called_once_with(
+            [macro_recorder.sys.executable, *macro_recorder.sys.argv],
+            cwd=macro_recorder.Path.cwd(),
+            close_fds=True,
+        )
+        recorder.close.assert_called_once()
+
     def test_recording_batches_ui_refreshes_and_limits_visible_history(self):
         callbacks = []
         inserted_rows = []
@@ -145,6 +250,8 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.background_target_var = SimpleNamespace(get=lambda: "Foreground input")
         recorder.background_targets = {}
         recorder.focus_interval_var = SimpleNamespace(get=lambda: "10")
+        recorder.recording_loop_interval_var = SimpleNamespace(get=lambda: "0")
+        recorder.timed_runes_var = SimpleNamespace(get=lambda: False)
         recorder.automation_slot = 7
         recorder.automation_backpack = 1
         recorder.automation_stop = threading.Event()
@@ -202,6 +309,7 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         self.assertIn("unix id is 123", script)
         self.assertIn('name is "Game \\"One\\""', script)
         self.assertIn('perform action "AXRaise"', script)
+        self.assertIn('set value of attribute "AXMain" of targetWindow to true', script)
 
     def test_focus_is_reused_until_configured_interval_expires(self):
         with tempfile.TemporaryFile(mode="w+") as focus_state:
