@@ -26,6 +26,8 @@ import subprocess
 import sys
 import tempfile
 import fcntl
+import copy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -54,8 +56,69 @@ except ModuleNotFoundError as error:
     ttk = None  # type: ignore[assignment]
 
 
+@dataclass
+class MacroSession:
+    session_id: str
+    name: str
+    state: dict[str, Any] = field(default_factory=dict)
+
+
 class MacroRecorder:
+    SESSION_STATE_FIELDS = frozenset(
+        {
+            "events", "events_lock", "event_refresh_pending", "recording", "playing",
+            "stop_playback", "last_event_time", "last_move_time", "playback_error",
+            "automation_running", "automation_timed_runes", "automation_stop",
+            "background_pause", "background_thread", "background_held_keys",
+            "background_held_buttons", "background_button_positions", "automation_backpack",
+            "automation_slot", "automation_target_pid", "automation_target_window_id",
+            "automation_focus_interval", "last_focus_time", "backpack_names", "profile",
+            "threshold_var", "slot_size_var", "profile_status", "background_enabled",
+            "background_target_var", "focus_interval_var", "recording_loop_interval_var",
+            "timed_runes_var", "rune_interval_var", "recording_loop_interval",
+            "rune_interval", "status", "event_count",
+        }
+    )
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in MacroRecorder.SESSION_STATE_FIELDS:
+            try:
+                sessions = object.__getattribute__(self, "_sessions")
+                context = object.__getattribute__(self, "_session_context")
+                session_id = getattr(context, "session_id", None)
+                if session_id is None:
+                    session_id = object.__getattribute__(self, "_active_session_id")
+                session = sessions.get(session_id)
+                if session is not None and name in session.state:
+                    return session.state[name]
+            except AttributeError:
+                pass
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in MacroRecorder.SESSION_STATE_FIELDS:
+            try:
+                sessions = object.__getattribute__(self, "_sessions")
+                context = object.__getattribute__(self, "_session_context")
+                session_id = getattr(context, "session_id", None)
+                if session_id is None:
+                    session_id = object.__getattribute__(self, "_active_session_id")
+                session = sessions.get(session_id)
+                if session is not None:
+                    session.state[name] = value
+                    return
+            except AttributeError:
+                pass
+        object.__setattr__(self, name, value)
+
     def __init__(self, root: tk.Tk) -> None:
+        self._sessions: dict[str, MacroSession] = {}
+        self._active_session_id = "session-1"
+        self._next_session_number = 2
+        self._session_context = threading.local()
+        self._session_ui_switching = False
+        self._sessions[self._active_session_id] = MacroSession(self._active_session_id, "Session 1")
+
         self.root = root
         self.root.title("Macro Recorder")
         self.root.geometry("820x760")
@@ -107,6 +170,7 @@ class MacroRecorder:
             "cast_key": "f5",
             "cast_delay": 1.0,
         }
+        self._default_profile = copy.deepcopy(self.profile)
         self.threshold_var = tk.StringVar(value="80")
         self.slot_size_var = tk.StringVar(value="34 x 34")
         self.profile_status = tk.StringVar(value="Profile not calibrated")
@@ -121,6 +185,7 @@ class MacroRecorder:
 
         self.status = tk.StringVar(value="Ready")
         self.event_count = tk.StringVar(value="0 events")
+        self.session_selector_var = tk.StringVar(value="Session 1")
         self._build_ui()
 
         self.mouse_listener = mouse.Listener(
@@ -171,6 +236,20 @@ class MacroRecorder:
             text="Record actions across macOS apps and replay them later.",
         ).pack(anchor="w", pady=(2, 16))
 
+        session_row = ttk.Frame(frame)
+        session_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(session_row, text="Active macro session:").pack(side="left")
+        self.session_selector = ttk.Combobox(
+            session_row,
+            width=18,
+            textvariable=self.session_selector_var,
+            state="readonly",
+            values=("Session 1",),
+        )
+        self.session_selector.pack(side="left", padx=(6, 8))
+        self.session_selector.bind("<<ComboboxSelected>>", self._on_session_selected)
+        ttk.Button(session_row, text="New session", command=self.add_session).pack(side="left")
+
         controls = ttk.Frame(frame)
         controls.pack(fill="x")
         self.record_button = ttk.Button(controls, text="●  Record (F8)", command=self.toggle_recording)
@@ -192,8 +271,14 @@ class MacroRecorder:
         ttk.Separator(frame).pack(fill="x", pady=18)
         status_row = ttk.Frame(frame)
         status_row.pack(fill="x")
-        ttk.Label(status_row, textvariable=self.status, font=(".AppleSystemUIFont", 13, "bold")).pack(side="left")
-        ttk.Label(status_row, textvariable=self.event_count).pack(side="right")
+        self.status_label = ttk.Label(
+            status_row,
+            textvariable=self.status,
+            font=(".AppleSystemUIFont", 13, "bold"),
+        )
+        self.status_label.pack(side="left")
+        self.event_count_label = ttk.Label(status_row, textvariable=self.event_count)
+        self.event_count_label.pack(side="right")
 
         self.events_view = tk.Listbox(frame, height=10, activestyle="none")
         self.events_view.pack(fill="both", expand=True, pady=(10, 12))
@@ -206,28 +291,37 @@ class MacroRecorder:
         automation = ttk.LabelFrame(frame, text="Rune automation", padding=10)
         automation.pack(fill="x", pady=(14, 0))
         ttk.Label(automation, text="Mana threshold (%):").grid(row=0, column=0, sticky="w")
-        ttk.Entry(automation, width=7, textvariable=self.threshold_var).grid(row=0, column=1, sticky="w", padx=(6, 14))
+        self.threshold_entry = ttk.Entry(automation, width=7, textvariable=self.threshold_var)
+        self.threshold_entry.grid(row=0, column=1, sticky="w", padx=(6, 14))
         ttk.Label(automation, textvariable=self.slot_size_var).grid(row=0, column=2, sticky="w")
         ttk.Button(automation, text="Start automation", command=self.start_automation).grid(row=0, column=3, padx=(12, 5))
         ttk.Button(automation, text="Stop automation", command=self.stop_automation).grid(row=0, column=4)
         rune_timer_row = ttk.Frame(automation)
         rune_timer_row.grid(row=1, column=0, columnspan=5, sticky="w", pady=(7, 0))
-        ttk.Checkbutton(
+        self.timed_runes_checkbutton = ttk.Checkbutton(
             rune_timer_row,
             text="Use timer instead of mana pixel",
             variable=self.timed_runes_var,
-        ).pack(side="left")
+        )
+        self.timed_runes_checkbutton.pack(side="left")
         ttk.Label(rune_timer_row, text="Rune interval (sec):").pack(side="left", padx=(12, 4))
-        ttk.Entry(rune_timer_row, width=7, textvariable=self.rune_interval_var).pack(side="left")
+        self.rune_interval_entry = ttk.Entry(rune_timer_row, width=7, textvariable=self.rune_interval_var)
+        self.rune_interval_entry.pack(side="left")
         loop_row = ttk.Frame(automation)
         loop_row.grid(row=2, column=0, columnspan=5, sticky="w", pady=(7, 0))
-        ttk.Checkbutton(
+        self.background_checkbutton = ttk.Checkbutton(
             loop_row,
             text="Loop loaded fishing/eating recording while waiting",
             variable=self.background_enabled,
-        ).pack(side="left")
+        )
+        self.background_checkbutton.pack(side="left")
         ttk.Label(loop_row, text="Pause between loops (sec):").pack(side="left", padx=(12, 4))
-        ttk.Entry(loop_row, width=6, textvariable=self.recording_loop_interval_var).pack(side="left")
+        self.recording_loop_interval_entry = ttk.Entry(
+            loop_row,
+            width=6,
+            textvariable=self.recording_loop_interval_var,
+        )
+        self.recording_loop_interval_entry.pack(side="left")
         target_row = ttk.Frame(automation)
         target_row.grid(row=3, column=0, columnspan=5, sticky="w", pady=(7, 0))
         ttk.Label(target_row, text="Window to focus:").pack(side="left")
@@ -241,7 +335,8 @@ class MacroRecorder:
         self.background_target_menu.pack(side="left", padx=(6, 6))
         ttk.Button(target_row, text="Refresh windows", command=self._refresh_background_targets).pack(side="left")
         ttk.Label(target_row, text="Refocus every (sec):").pack(side="left", padx=(12, 4))
-        ttk.Entry(target_row, width=6, textvariable=self.focus_interval_var).pack(side="left")
+        self.focus_interval_entry = ttk.Entry(target_row, width=6, textvariable=self.focus_interval_var)
+        self.focus_interval_entry.pack(side="left")
         ttk.Label(
             automation,
             text="Selected window receives normal foreground mouse and keyboard input.",
@@ -262,9 +357,154 @@ class MacroRecorder:
         ]
         for index, (label, command) in enumerate(other_calibration_buttons):
             ttk.Button(calibration, text=label, command=command).grid(row=2 + index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=2)
-        ttk.Label(automation, textvariable=self.profile_status, foreground="#666666").grid(row=6, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.profile_status_label = ttk.Label(
+            automation,
+            textvariable=self.profile_status,
+            foreground="#666666",
+        )
+        self.profile_status_label.grid(row=6, column=0, columnspan=5, sticky="w", pady=(8, 0))
         ttk.Button(automation, text="Test mana point", command=self.test_mana_point).grid(row=7, column=0, sticky="w", pady=(8, 0))
         ttk.Button(automation, text="Reset held keys", command=self.release_stuck_inputs).grid(row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+    @property
+    def active_session_id(self) -> str:
+        return self._active_session_id
+
+    @property
+    def active_session(self) -> MacroSession:
+        return self._sessions[self._active_session_id]
+
+    def _new_session(self, name: str) -> MacroSession:
+        session_id = f"session-{self._next_session_number}"
+        self._next_session_number += 1
+        session = MacroSession(session_id, name)
+        session.state.update(
+            {
+                "events": [],
+                "events_lock": threading.Lock(),
+                "event_refresh_pending": False,
+                "recording": False,
+                "playing": False,
+                "stop_playback": threading.Event(),
+                "last_event_time": None,
+                "last_move_time": None,
+                "playback_error": None,
+                "automation_running": False,
+                "automation_timed_runes": False,
+                "automation_stop": threading.Event(),
+                "background_pause": threading.Event(),
+                "background_thread": None,
+                "background_held_keys": set(),
+                "background_held_buttons": set(),
+                "background_button_positions": {},
+                "automation_backpack": 0,
+                "automation_slot": 1,
+                "automation_target_pid": None,
+                "automation_target_window_id": None,
+                "automation_focus_interval": 10.0,
+                "last_focus_time": 0.0,
+                "backpack_names": ["bp1", "bp2"],
+                "profile": copy.deepcopy(self._default_profile),
+                "threshold_var": tk.StringVar(value="80"),
+                "slot_size_var": tk.StringVar(value="34 x 34"),
+                "profile_status": tk.StringVar(value="Profile not calibrated"),
+                "background_enabled": tk.BooleanVar(value=False),
+                "background_target_var": tk.StringVar(value="Foreground input"),
+                "focus_interval_var": tk.StringVar(value="10"),
+                "recording_loop_interval_var": tk.StringVar(value="0"),
+                "timed_runes_var": tk.BooleanVar(value=False),
+                "rune_interval_var": tk.StringVar(value="60"),
+                "recording_loop_interval": 0.0,
+                "rune_interval": 60.0,
+                "status": tk.StringVar(value="Ready"),
+                "event_count": tk.StringVar(value="0 events"),
+            }
+        )
+        self._sessions[session_id] = session
+        return session
+
+    def add_session(self) -> None:
+        session = self._new_session(f"Session {self._next_session_number}")
+        self.session_selector.configure(values=tuple(item.name for item in self._sessions.values()))
+        self._switch_session(session.session_id)
+
+    def _on_session_selected(self, _event: Any = None) -> None:
+        name = self.session_selector_var.get()
+        session = next((item for item in self._sessions.values() if item.name == name), None)
+        if session is not None:
+            self._switch_session(session.session_id)
+
+    def _switch_session(self, session_id: str) -> None:
+        if session_id == self._active_session_id or session_id not in self._sessions:
+            return
+        if self.recording:
+            self.toggle_recording()
+        self._active_session_id = session_id
+        self._session_ui_switching = True
+        try:
+            session = self.active_session
+            self.session_selector_var.set(session.name)
+            self.threshold_entry.configure(textvariable=session.state["threshold_var"])
+            self.rune_interval_entry.configure(textvariable=session.state["rune_interval_var"])
+            self.recording_loop_interval_entry.configure(
+                textvariable=session.state["recording_loop_interval_var"]
+            )
+            self.focus_interval_entry.configure(textvariable=session.state["focus_interval_var"])
+            self.background_checkbutton.configure(variable=session.state["background_enabled"])
+            self.timed_runes_checkbutton.configure(variable=session.state["timed_runes_var"])
+            self.background_target_menu.configure(textvariable=session.state["background_target_var"])
+            self.background_target_menu.set(session.state["background_target_var"].get())
+            self.status_label.configure(textvariable=session.state["status"])
+            self.event_count_label.configure(textvariable=session.state["event_count"])
+            self.profile_status_label.configure(textvariable=session.state["profile_status"])
+            self._rebuild_backpack_buttons()
+            self.record_button.configure(
+                text="■  Stop (F8)" if session.state["recording"] else "●  Record (F8)"
+            )
+            self.play_button.configure(
+                state="disabled" if session.state["playing"] else "normal"
+            )
+            self.status.set(session.state["status"].get())
+            self.profile_status.set(session.state["profile_status"].get())
+            self.event_count.set(session.state["event_count"].get())
+            self._refresh_events()
+        finally:
+            self._session_ui_switching = False
+
+    def _run_in_session(
+        self,
+        session_id: str,
+        callback: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        previous = getattr(self._session_context, "session_id", None)
+        self._session_context.session_id = session_id
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            if previous is None:
+                del self._session_context.session_id
+            else:
+                self._session_context.session_id = previous
+
+    def _schedule_in_session(
+        self,
+        session_id: str,
+        callback: Any,
+        *args: Any,
+        delay_ms: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        self.root.after(
+            delay_ms,
+            lambda: self._run_in_session(session_id, callback, *args, **kwargs),
+        )
+
+    def _set_session_status(self, session_id: str, text: str) -> None:
+        self._sessions[session_id].state["status"].set(text)
+        if session_id == self._active_session_id:
+            self.status.set(text)
 
     def _update_ui_scroll_region(self, _event: Any = None) -> None:
         self.ui_canvas.configure(scrollregion=self.ui_canvas.bbox("all"))
@@ -408,7 +648,11 @@ class MacroRecorder:
         last_focused = float(state.get("focused_at", 0.0))
         if force or state.get("target") != target or now - last_focused >= self.automation_focus_interval:
             self._focus_target_window(*target)
-            state = {"target": target, "focused_at": now}
+            state = {
+                "target": target,
+                "focused_at": now,
+                "lease_until": now + self.automation_focus_interval,
+            }
             self.focus_lock_file.seek(0)
             self.focus_lock_file.truncate()
             json.dump(state, self.focus_lock_file)
@@ -419,20 +663,44 @@ class MacroRecorder:
         if self.automation_target_pid is None:
             return
         owner = threading.get_ident()
-        if self.focus_input_owner != owner:
+        if self.focus_input_owner == owner:
+            return
+        while True:
             self.focus_input_mutex.acquire()
             self.focus_input_owner = owner
             try:
                 self._acquire_focus_file_lock()
+                self.focus_lock_file.seek(0)
+                try:
+                    state = json.loads(self.focus_lock_file.read() or "{}")
+                except json.JSONDecodeError:
+                    state = {}
+                target = [self.automation_target_pid, self.automation_target_window_id]
+                now = time.monotonic()
+                lease_until = float(state.get("lease_until", 0.0))
+                if (
+                    state.get("target") != target
+                    and lease_until > now
+                    and not self.automation_stop.is_set()
+                ):
+                    remaining = min(lease_until - now, 0.25)
+                    self._release_focus_file_lock()
+                    self.focus_input_owner = None
+                    self.focus_input_mutex.release()
+                    self.automation_stop.wait(remaining)
+                    continue
+                should_refocus = (
+                    state.get("target") != target
+                    or lease_until <= now
+                    or now - self.last_focus_time >= self.automation_focus_interval
+                )
+                self._ensure_target_focused(force=should_refocus)
+                return
             except Exception:
+                self._release_focus_file_lock()
                 self.focus_input_owner = None
                 self.focus_input_mutex.release()
                 raise
-        try:
-            self._ensure_target_focused()
-        except Exception:
-            self._release_focused_input()
-            raise
 
     def _release_focused_input(self) -> None:
         if self.focus_input_owner == threading.get_ident():
@@ -446,12 +714,8 @@ class MacroRecorder:
             or time.monotonic() - self.last_focus_time < self.automation_focus_interval
         ):
             return
-        with self.focus_input_mutex:
-            self._acquire_focus_file_lock()
-            try:
-                self._ensure_target_focused(force=True)
-            finally:
-                self._release_focus_file_lock()
+        self._begin_focused_input()
+        self._release_focused_input()
 
     def _target_window_image(self, window_id: int) -> tuple[Any, dict[str, float]]:
         if Quartz is None or Image is None:
@@ -516,7 +780,8 @@ class MacroRecorder:
             if self.event_refresh_pending:
                 return
             self.event_refresh_pending = True
-        self.root.after(200, self._refresh_events)
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
+        self._schedule_in_session(session_id, self._refresh_events, delay_ms=200)
 
     def _on_move(self, x: int, y: int) -> None:
         # Sample movement rather than recording every OS mouse event.
@@ -533,29 +798,40 @@ class MacroRecorder:
         self._record_event({"type": "scroll", "x": x, "y": y, "dx": dx, "dy": dy})
 
     def _on_press(self, key: Key | KeyCode) -> None:
+        session_id = self._active_session_id
         if key == Key.f1:
-            self.root.after(0, lambda: self.calibrate_point("mana_point"))
+            self._schedule_in_session(session_id, self.calibrate_point, "mana_point")
             return
         if key == Key.f2:
-            self.root.after(0, self.calibrate_mana_color)
+            self._schedule_in_session(session_id, self.calibrate_mana_color)
             return
         if key == Key.f6:
-            self.root.after(0, lambda: self.calibrate_point("bp1", delay_seconds=1.5))
+            self._schedule_in_session(
+                session_id,
+                self.calibrate_point,
+                "bp1",
+                delay_seconds=1.5,
+            )
             return
         if key == Key.f7:
-            self.root.after(0, lambda: self.calibrate_point("bp2", delay_seconds=1.5))
+            self._schedule_in_session(
+                session_id,
+                self.calibrate_point,
+                "bp2",
+                delay_seconds=1.5,
+            )
             return
         if key == Key.f8:
-            self.root.after(0, self.toggle_recording)
+            self._schedule_in_session(session_id, self.toggle_recording)
             return
         if key == Key.f9:
-            self.root.after(0, self.start_playback)
+            self._schedule_in_session(session_id, self.start_playback)
             return
         if key == Key.f10:
-            self.root.after(0, self.clear)
+            self._schedule_in_session(session_id, self.clear)
             return
         if key == Key.f11:
-            self.root.after(0, self.stop)
+            self._schedule_in_session(session_id, self.stop)
             return
         if self.recording and not self.playing:
             self._record_event({"type": "key_down", "key": self._serialize_key(key)})
@@ -585,7 +861,8 @@ class MacroRecorder:
             self.recording = False
             self.last_event_time = None
             self.status.set("Recording stopped")
-            self.record_button.configure(text="●  Record (F8)")
+            if getattr(self._session_context, "session_id", self._active_session_id) == self._active_session_id:
+                self.record_button.configure(text="●  Record (F8)")
         else:
             self.events.clear()
             self._refresh_events()
@@ -593,7 +870,8 @@ class MacroRecorder:
             self.last_move_time = None
             self.recording = True
             self.status.set("Recording…")
-            self.record_button.configure(text="■  Stop (F8)")
+            if getattr(self._session_context, "session_id", self._active_session_id) == self._active_session_id:
+                self.record_button.configure(text="■  Stop (F8)")
 
     def start_playback(self) -> None:
         if self.recording or self.playing or self.automation_running or not self.events:
@@ -602,8 +880,13 @@ class MacroRecorder:
         self.stop_playback.clear()
         self.playback_error = None
         self.status.set("Repeating… (F11 to stop)")
-        self.play_button.configure(state="disabled")
-        threading.Thread(target=self._playback, daemon=True).start()
+        if getattr(self._session_context, "session_id", self._active_session_id) == self._active_session_id:
+            self.play_button.configure(state="disabled")
+        threading.Thread(
+            target=self._run_in_session,
+            args=(self._active_session_id, self._playback),
+            daemon=True,
+        ).start()
 
     def _playback(self) -> None:
         try:
@@ -630,11 +913,14 @@ class MacroRecorder:
         except Exception as error:
             self.playback_error = f"{type(error).__name__}: {error}"
         finally:
-            self.root.after(0, self._playback_finished)
+            session_id = getattr(self._session_context, "session_id", self._active_session_id)
+            self._schedule_in_session(session_id, self._playback_finished)
 
     def _playback_finished(self) -> None:
         self.playing = False
-        self.play_button.configure(state="normal")
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
+        if session_id == self._active_session_id:
+            self.play_button.configure(state="normal")
         if self.playback_error:
             self.status.set(f"Replay error: {self.playback_error}")
         else:
@@ -659,6 +945,9 @@ class MacroRecorder:
             self.event_refresh_pending = False
             events = self.events[-200:]
             event_count = len(self.events)
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
+        if session_id != self._active_session_id:
+            return
         self.events_view.delete(0, tk.END)
         for event in events:
             kind = event["type"]
@@ -675,7 +964,8 @@ class MacroRecorder:
         self.events_view.yview_moveto(1.0)
 
     def close(self) -> None:
-        self.stop()
+        for session_id in tuple(self._sessions):
+            self._run_in_session(session_id, self.stop)
         self.mouse_listener.stop()
         self.keyboard_listener.stop()
         self.focus_lock_file.close()
@@ -773,7 +1063,13 @@ class MacroRecorder:
     def calibrate_point(self, target: str, delay_seconds: float = 0.0) -> None:
         if delay_seconds > 0:
             self.status.set(f"Move the cursor to {target.upper()} first slot… capturing in {delay_seconds:.1f}s")
-            self.root.after(int(delay_seconds * 1000), lambda: self._capture_point(target))
+            session_id = getattr(self._session_context, "session_id", self._active_session_id)
+            self._schedule_in_session(
+                session_id,
+                self._capture_point,
+                target,
+                delay_ms=int(delay_seconds * 1000),
+            )
             return
         self.status.set(f"Capturing {target.replace('_', ' ')} from the current cursor position")
         self._capture_point(target)
@@ -885,24 +1181,23 @@ class MacroRecorder:
         self.automation_timed_runes = timed_runes
         self.rune_interval = rune_interval
         self.last_focus_time = 0.0
-        if target is not None:
-            try:
-                self._ensure_target_focused(force=True)
-            except Exception as error:
-                self._release_focus_file_lock()
-                self.automation_target_pid = None
-                self.automation_target_window_id = None
-                messagebox.showerror("Rune automation", str(error))
-                return
-            self._release_focus_file_lock()
         self.automation_running = True
         self.automation_stop.clear()
         self.background_pause.clear()
         self.status.set("Automation waiting for mana…")
+        session_id = self._active_session_id
         if self.background_enabled.get() and self.events:
-            self.background_thread = threading.Thread(target=self._background_loop, daemon=True)
+            self.background_thread = threading.Thread(
+                target=self._run_in_session,
+                args=(session_id, self._background_loop),
+                daemon=True,
+            )
             self.background_thread.start()
-        threading.Thread(target=self._automation_loop, daemon=True).start()
+        threading.Thread(
+            target=self._run_in_session,
+            args=(session_id, self._automation_loop),
+            daemon=True,
+        ).start()
 
     def _read_recording_loop_interval(self) -> float:
         try:
@@ -942,6 +1237,7 @@ class MacroRecorder:
             self.release_stuck_inputs()
 
     def _automation_loop(self) -> None:
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
         try:
             if self.automation_timed_runes:
                 self._timed_automation_loop()
@@ -955,28 +1251,38 @@ class MacroRecorder:
                     if not self._rune_once():
                         self.automation_stop.set()
                         break
-                    self.root.after(0, lambda value=mana: self.status.set(f"Rune cast at {value:.0f}% mana"))
+                    self._schedule_in_session(
+                        session_id,
+                        self.status.set,
+                        f"Rune cast at {mana:.0f}% mana",
+                    )
                     if self.automation_stop.wait(float(self.profile.get("cast_delay", 1.0))):
                         break
                 else:
                     self.background_pause.clear()
-                    self.root.after(0, lambda value=mana: self.status.set(f"Waiting: mana {value:.0f}%"))
+                    self._schedule_in_session(
+                        session_id,
+                        self.status.set,
+                        f"Waiting: mana {mana:.0f}%",
+                    )
                     if self.automation_stop.wait(0.35):
                         break
         except Exception as error:
-            self.root.after(0, lambda: messagebox.showerror("Rune automation", f"{type(error).__name__}: {error}"))
+            error_message = f"{type(error).__name__}: {error}"
+            self.root.after(0, lambda text=error_message: messagebox.showerror("Rune automation", text))
         finally:
             self.automation_running = False
             self.background_pause.set()
-            self.root.after(0, lambda: self.status.set("Automation stopped"))
+            self._schedule_in_session(session_id, self.status.set, "Automation stopped")
 
     def _timed_automation_loop(self) -> None:
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
+        self._focus_target_if_due()
         while not self.automation_stop.is_set():
-            self.root.after(
-                0,
-                lambda interval=self.rune_interval: self.status.set(
-                    f"Next rune in {interval:g} seconds"
-                ),
+            self._schedule_in_session(
+                session_id,
+                self.status.set,
+                f"Next rune in {self.rune_interval:g} seconds",
             )
             if not self._wait_for_next_rune():
                 return
@@ -985,7 +1291,7 @@ class MacroRecorder:
             if not self._rune_once():
                 self.automation_stop.set()
                 return
-            self.root.after(0, lambda: self.status.set("Rune made (timer mode)"))
+            self._schedule_in_session(session_id, self.status.set, "Rune made (timer mode)")
             self.background_pause.clear()
 
     def _wait_for_next_rune(self) -> bool:
@@ -1142,7 +1448,12 @@ class MacroRecorder:
         slot_x = int(round(first_x + (self.automation_slot % columns) * int(self.profile.get("slot_width", 34))))
         slot_y = int(round(first_y + (self.automation_slot // columns) * int(self.profile.get("slot_height", 34))))
         hand_x, hand_y = [int(round(value)) for value in self.profile["left_hand"]]
-        self.root.after(0, lambda: self.status.set(f"Dragging {backpack_name} slot {self.automation_slot + 1}"))
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
+        self._schedule_in_session(
+            session_id,
+            self.status.set,
+            f"Dragging {backpack_name} slot {self.automation_slot + 1}",
+        )
         self._begin_focused_input()
         try:
             self._move_mouse(slot_x, slot_y)

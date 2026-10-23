@@ -15,6 +15,10 @@ class DummyKey:
     def __init__(self, name=None):
         self.name = name
 
+
+for _key_name in ("f1", "f2", "f6", "f7", "f8", "f9", "f10", "f11"):
+    setattr(DummyKey, _key_name, DummyKey(_key_name))
+
 class DummyKeyCode:
     def __init__(self, char=None):
         self.char = char
@@ -98,6 +102,67 @@ class MacroRecorderColorTests(unittest.TestCase):
 
 
 class MacroRecorderAutomationTests(unittest.TestCase):
+    def test_new_session_gets_unique_numbered_name(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._next_session_number = 2
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession("session-1", "Session 1")
+        }
+        recorder._default_profile = {}
+        recorder.session_selector = Mock()
+        recorder._switch_session = Mock()
+
+        make_variable = lambda value=None: SimpleNamespace(
+            get=lambda: value,
+            set=lambda _value: None,
+        )
+        with patch.object(macro_recorder.tk, "StringVar", side_effect=make_variable), patch.object(
+            macro_recorder.tk, "BooleanVar", side_effect=make_variable
+        ):
+            recorder.add_session()
+
+        self.assertIn("session-2", recorder._sessions)
+        self.assertEqual(recorder._sessions["session-2"].name, "Session 2")
+        recorder._switch_session.assert_called_once_with("session-2")
+
+    def test_session_state_is_isolated_and_thread_context_selects_worker_session(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession(
+                "session-1",
+                "Session 1",
+                {"events": ["server 1"], "profile": {"server": 1}},
+            ),
+            "session-2": macro_recorder.MacroSession(
+                "session-2",
+                "Session 2",
+                {"events": ["server 2"], "profile": {"server": 2}},
+            ),
+        }
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
+
+        self.assertEqual(recorder.events, ["server 1"])
+        recorder._run_in_session("session-2", lambda: recorder.events.append("event 2"))
+        self.assertEqual(recorder.events, ["server 1"])
+        self.assertEqual(
+            recorder._run_in_session("session-2", lambda: recorder.profile["server"]),
+            2,
+        )
+
+    def test_hotkey_is_routed_to_active_session(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._active_session_id = "session-2"
+        recorder._session_context = threading.local()
+        recorder._schedule_in_session = Mock()
+
+        recorder._on_press(DummyKey.f8)
+
+        recorder._schedule_in_session.assert_called_once_with(
+            "session-2",
+            recorder.toggle_recording,
+        )
+
     def test_rune_interval_accepts_positive_seconds_and_rejects_invalid_values(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
         recorder.rune_interval_var = SimpleNamespace(get=lambda: "45.5")
@@ -117,6 +182,8 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.background_pause = threading.Event()
         recorder.root = SimpleNamespace(after=lambda _delay, callback: callback())
         recorder.status = SimpleNamespace(set=statuses.append)
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
         recorder._focus_target_if_due = Mock()
         recorder.release_stuck_inputs = Mock()
         recorder._rune_once = Mock(return_value=True)
@@ -126,7 +193,7 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             recorder._timed_automation_loop()
 
         self.assertEqual(wait.call_args_list, [unittest.mock.call(0.25), unittest.mock.call(0.25)])
-        self.assertEqual(recorder._focus_target_if_due.call_count, 2)
+        self.assertEqual(recorder._focus_target_if_due.call_count, 3)
         recorder._rune_once.assert_called_once()
         recorder._read_mana_percent.assert_not_called()
         self.assertEqual(statuses, ["Next rune in 0.25 seconds", "Rune made (timer mode)", "Next rune in 0.25 seconds"])
@@ -213,6 +280,8 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.events_lock = threading.Lock()
         recorder.event_refresh_pending = False
         recorder.last_event_time = None
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
         recorder.root = SimpleNamespace(after=lambda delay, callback: callbacks.append((delay, callback)))
         recorder.events_view = SimpleNamespace(
             delete=lambda *_args: inserted_rows.clear(),
@@ -238,6 +307,8 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.recording = False
         recorder.playing = False
         recorder.automation_running = False
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
         recorder.profile = {
             "bp1": {"first_slot": (10, 10)},
             "bp2": {"first_slot": (20, 20)},
@@ -332,6 +403,29 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             state = json.loads(focus_state.read())
             self.assertEqual(state["target"], [123, 456])
             self.assertGreater(state["focused_at"], 0)
+
+    def test_focused_input_reserves_configured_session_turn(self):
+        with tempfile.TemporaryFile(mode="w+") as focus_state:
+            recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+            recorder.automation_target_pid = 123
+            recorder.automation_target_window_id = 456
+            recorder.automation_focus_interval = 5
+            recorder.last_focus_time = 0
+            recorder.automation_stop = threading.Event()
+            recorder.focus_input_mutex = threading.RLock()
+            recorder.focus_input_owner = None
+            recorder.focus_lock_held = False
+            recorder.focus_lock_file = focus_state
+            recorder._focus_target_window = Mock()
+
+            recorder._begin_focused_input()
+            recorder._release_focused_input()
+
+            recorder._focus_target_window.assert_called_once_with(123, 456)
+            focus_state.seek(0)
+            state = json.loads(focus_state.read())
+            self.assertEqual(state["target"], [123, 456])
+            self.assertGreaterEqual(state["lease_until"] - state["focused_at"], 5)
 
     def test_background_mana_sample_maps_screen_point_into_window_image(self):
         image = SimpleNamespace(

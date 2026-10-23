@@ -28,6 +28,12 @@ Use the global hotkeys:
 - `F10`: clear the recording
 - `F11`: stop recording or replay, or click the **Stop** button
 
+## Multiple macro sessions
+
+Use **New session** to create a separate macro workspace for each game server, then select the intended **Active macro session** before using a hotkey. Each session has its own recording, profile, calibration, rune cursor, automation mode, and timing/focus settings. F1/F2/F6/F7 calibrations and F8-F11 controls are applied to the active session. Switching sessions stops an in-progress recording so the next mouse/key actions are not appended to the previous server's macro.
+
+Multiple sessions can keep rune automation running. They share the desktop mouse and keyboard, so their configured focus intervals act as turns: a session brings its selected game window forward for its turn, and another session waits for that turn to expire before taking input. macOS still allows only one focused window at a time.
+
 Use **Restart to load code** after changing the program files. Restarting starts the current script again and closes this instance; unsaved recordings and profile edits are discarded.
 
 macOS may require enabling both **Input Monitoring** and **Accessibility** in **System Settings → Privacy & Security**. Add the exact Python executable running the app, not only Terminal. Find it with:
@@ -48,7 +54,7 @@ If the mana pixel is unreliable, enable **Use timer instead of mana pixel** and 
 
 On macOS, select the game window in **Window to focus** and use **Refresh windows** to update the list. Set **Refocus every (sec)** to control how often the assistant brings that window to the front and makes it the main window while automation is running. The focus interval is checked throughout mana waits and timer waits, not only when it is time to make a rune. Calibrate the mana point/color and rune locations while that game window is visible. The assistant uses normal foreground mouse and keyboard input, so the selected window will receive those actions.
 
-Multiple recorder instances coordinate input so they do not switch windows in the middle of a held click or key. Each instance focuses its selected window before sending actions and at its configured interval. Since macOS can focus only one window at a time, the game windows will take turns being in front; this does not allow playing in another foreground window while automation is running.
+The application coordinates input across active sessions so it does not switch windows in the middle of a held click or key. It focuses each selected window at its configured interval. Since macOS can focus only one window at a time, the game windows take turns being in front; this does not allow playing in another foreground window while automation is running.
 
 macOS may request **Screen Recording** permission to read the selected window, and **Accessibility** permission for `osascript`/System Events to focus windows. **Input Monitoring** and **Accessibility** permissions for Python may also be required for global hotkeys and input.
 
