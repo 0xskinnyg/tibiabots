@@ -102,6 +102,95 @@ class MacroRecorderColorTests(unittest.TestCase):
 
 
 class MacroRecorderAutomationTests(unittest.TestCase):
+    def test_start_automation_prepares_every_session_before_launching(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            f"session-{number}": macro_recorder.MacroSession(
+                f"session-{number}",
+                f"Session {number}",
+                {"automation_running": False},
+            )
+            for number in (1, 2, 3)
+        }
+        recorder._session_context = threading.local()
+        operations = []
+        recorder._prepare_automation = Mock(
+            side_effect=lambda: operations.append(
+                ("prepare", recorder._session_context.session_id)
+            )
+            or True
+        )
+        recorder._launch_automation = Mock(
+            side_effect=lambda: operations.append(
+                ("launch", recorder._session_context.session_id)
+            )
+        )
+
+        recorder.start_automation()
+
+        self.assertEqual(
+            operations,
+            [
+                ("prepare", "session-1"),
+                ("prepare", "session-2"),
+                ("prepare", "session-3"),
+                ("launch", "session-1"),
+                ("launch", "session-2"),
+                ("launch", "session-3"),
+            ],
+        )
+
+    def test_start_automation_does_not_launch_any_session_if_one_fails_validation(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            f"session-{number}": macro_recorder.MacroSession(
+                f"session-{number}",
+                f"Session {number}",
+                {"automation_running": False},
+            )
+            for number in (1, 2)
+        }
+        recorder._session_context = threading.local()
+        recorder._prepare_automation = Mock(side_effect=[True, False])
+        recorder._launch_automation = Mock()
+
+        recorder.start_automation()
+
+        recorder._prepare_automation.assert_has_calls([unittest.mock.call(), unittest.mock.call()])
+        recorder._launch_automation.assert_not_called()
+
+    def test_stop_automation_signals_and_releases_every_running_session(self):
+        stop_events = [threading.Event() for _ in range(3)]
+        pause_events = [threading.Event() for _ in range(3)]
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            f"session-{number}": macro_recorder.MacroSession(
+                f"session-{number}",
+                f"Session {number}",
+                {
+                    "automation_running": running,
+                    "automation_stop": stop_events[number - 1],
+                    "background_pause": pause_events[number - 1],
+                },
+            )
+            for number, running in ((1, True), (2, False), (3, True))
+        }
+        recorder._session_context = threading.local()
+        released = []
+        recorder.release_stuck_inputs = lambda: released.append(
+            recorder._session_context.session_id
+        )
+
+        recorder.stop_automation()
+
+        self.assertTrue(stop_events[0].is_set())
+        self.assertFalse(stop_events[1].is_set())
+        self.assertTrue(stop_events[2].is_set())
+        self.assertTrue(pause_events[0].is_set())
+        self.assertFalse(pause_events[1].is_set())
+        self.assertTrue(pause_events[2].is_set())
+        self.assertEqual(released, ["session-1", "session-3"])
+
     def test_new_session_gets_unique_numbered_name(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
         recorder._next_session_number = 2
@@ -304,11 +393,14 @@ class MacroRecorderAutomationTests(unittest.TestCase):
 
     def test_start_automation_preserves_current_rune_slot(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession("session-1", "Session 1")
+        }
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
         recorder.recording = False
         recorder.playing = False
         recorder.automation_running = False
-        recorder._active_session_id = "session-1"
-        recorder._session_context = threading.local()
         recorder.profile = {
             "bp1": {"first_slot": (10, 10)},
             "bp2": {"first_slot": (20, 20)},

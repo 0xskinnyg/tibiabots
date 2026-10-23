@@ -248,6 +248,11 @@ class MacroRecorder:
         )
         self.session_selector.pack(side="left", padx=(6, 8))
         self.session_selector.bind("<<ComboboxSelected>>", self._on_session_selected)
+        ttk.Button(
+            session_row,
+            text="Start all automation",
+            command=self.start_automation,
+        ).pack(side="left", padx=(0, 8))
         ttk.Button(session_row, text="New session", command=self.add_session).pack(side="left")
 
         controls = ttk.Frame(frame)
@@ -294,8 +299,7 @@ class MacroRecorder:
         self.threshold_entry = ttk.Entry(automation, width=7, textvariable=self.threshold_var)
         self.threshold_entry.grid(row=0, column=1, sticky="w", padx=(6, 14))
         ttk.Label(automation, textvariable=self.slot_size_var).grid(row=0, column=2, sticky="w")
-        ttk.Button(automation, text="Start automation", command=self.start_automation).grid(row=0, column=3, padx=(12, 5))
-        ttk.Button(automation, text="Stop automation", command=self.stop_automation).grid(row=0, column=4)
+        ttk.Button(automation, text="Stop all automation", command=self.stop_automation).grid(row=0, column=3, columnspan=2, padx=(12, 5), sticky="w")
         rune_timer_row = ttk.Frame(automation)
         rune_timer_row.grid(row=1, column=0, columnspan=5, sticky="w", pady=(7, 0))
         self.timed_runes_checkbutton = ttk.Checkbutton(
@@ -1145,16 +1149,35 @@ class MacroRecorder:
     # Rune automation
 
     def start_automation(self) -> None:
-        if self.recording or self.playing or self.automation_running:
+        session_ids = tuple(self._sessions)
+        sessions_to_start = [
+            session_id
+            for session_id in session_ids
+            if not self._sessions[session_id].state["automation_running"]
+        ]
+        if not sessions_to_start:
             return
+        for session_id in sessions_to_start:
+            if not self._run_in_session(session_id, self._prepare_automation):
+                return
+        for session_id in sessions_to_start:
+            self._run_in_session(session_id, self._launch_automation)
+
+    def _prepare_automation(self) -> bool:
+        if self.recording or self.playing:
+            messagebox.showwarning(
+                "Rune automation",
+                "Stop recording or replay in every session before starting all automation.",
+            )
+            return False
         timed_runes = self.timed_runes_var.get()
         target = self._selected_background_target()
         if not timed_runes and target is None and ImageGrab is None:
             messagebox.showerror("Rune automation", "Install Pillow first: pip install Pillow")
-            return
+            return False
         if target is not None and (Quartz is None or (not timed_runes and Image is None)):
             messagebox.showerror("Rune automation", "Window targeting requires macOS Quartz and Pillow")
-            return
+            return False
         try:
             self._read_profile_fields()
             focus_interval = float(self.focus_interval_var.get())
@@ -1164,7 +1187,7 @@ class MacroRecorder:
             rune_interval = self._read_rune_interval() if timed_runes else 0.0
         except ValueError as error:
             messagebox.showerror("Rune automation", str(error))
-            return
+            return False
         required = [self.profile[name].get("first_slot") for name in self.backpack_names]
         required.append(self.profile.get("left_hand"))
         if not timed_runes:
@@ -1174,18 +1197,25 @@ class MacroRecorder:
             if not timed_runes:
                 calibration += ", mana point, and mana color"
             messagebox.showwarning("Rune automation", f"Calibrate {calibration} first.")
-            return
+            return False
         self.automation_target_pid, self.automation_target_window_id = target or (None, None)
         self.automation_focus_interval = focus_interval
         self.recording_loop_interval = loop_interval
         self.automation_timed_runes = timed_runes
         self.rune_interval = rune_interval
         self.last_focus_time = 0.0
+        return True
+
+    def _launch_automation(self) -> None:
         self.automation_running = True
         self.automation_stop.clear()
         self.background_pause.clear()
-        self.status.set("Automation waiting for mana…")
-        session_id = self._active_session_id
+        self.status.set(
+            "Automation waiting for next rune…"
+            if self.automation_timed_runes
+            else "Automation waiting for mana…"
+        )
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
         if self.background_enabled.get() and self.events:
             self.background_thread = threading.Thread(
                 target=self._run_in_session,
@@ -1231,10 +1261,19 @@ class MacroRecorder:
             messagebox.showerror("Mana test", str(error))
 
     def stop_automation(self) -> None:
-        if self.automation_running:
-            self.automation_stop.set()
-            self.background_pause.set()
-            self.release_stuck_inputs()
+        running_sessions = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.state["automation_running"]
+        ]
+        for session_id in running_sessions:
+            self._run_in_session(session_id, self._request_automation_stop)
+        for session_id in running_sessions:
+            self._run_in_session(session_id, self.release_stuck_inputs)
+
+    def _request_automation_stop(self) -> None:
+        self.automation_stop.set()
+        self.background_pause.set()
 
     def _automation_loop(self) -> None:
         session_id = getattr(self._session_context, "session_id", self._active_session_id)

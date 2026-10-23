@@ -30,9 +30,9 @@ Use the global hotkeys:
 
 ## Multiple macro sessions
 
-Use **New session** to create a separate macro workspace for each game server, then select the intended **Active macro session** before using a hotkey. Each session has its own recording, profile, calibration, rune cursor, automation mode, and timing/focus settings. F1/F2/F6/F7 calibrations and F8-F11 controls are applied to the active session. Switching sessions stops an in-progress recording so the next mouse/key actions are not appended to the previous server's macro.
+Use **New session** to create a separate macro workspace for each game server. Each session has its own recording, profile, calibration, rune cursor, automation mode, and timing/focus settings. Select the intended **Active macro session** before using a hotkey; F1/F2/F6/F7 calibrations and F8-F11 controls apply to that session. Switching sessions stops an in-progress recording so the next mouse/key actions are not appended to the previous server's macro.
 
-Multiple sessions can keep rune automation running. They share the desktop mouse and keyboard, so their configured focus intervals act as turns: a session brings its selected game window forward for its turn, and another session waits for that turn to expire before taking input. macOS still allows only one focused window at a time.
+Use **Start all automation** beside the session selector to validate and start automation for every session using that session's own settings. If any session is not ready, none of the sessions are newly started. **Stop all automation** signals every running session. The automation workers run independently, but share the desktop mouse and keyboard, so their configured focus intervals act as turns: a session brings its selected game window forward for its turn, and another session waits for that turn to expire before taking input. macOS still allows only one focused window at a time.
 
 Use **Restart to load code** after changing the program files. Restarting starts the current script again and closes this instance; unsaved recordings and profile edits are discarded.
 
