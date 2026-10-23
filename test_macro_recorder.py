@@ -1,7 +1,9 @@
 import sys
+import threading
 import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 pynput = types.ModuleType("pynput")
 keyboard_mod = types.ModuleType("pynput.keyboard")
@@ -91,6 +93,42 @@ class MacroRecorderColorTests(unittest.TestCase):
 
         macro_recorder.ImageGrab = original_grab
         macro_recorder.mouse = original_mouse
+
+
+class MacroRecorderAutomationTests(unittest.TestCase):
+    def test_start_automation_preserves_current_rune_slot(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.recording = False
+        recorder.playing = False
+        recorder.automation_running = False
+        recorder.profile = {
+            "bp1": {"first_slot": (10, 10)},
+            "bp2": {"first_slot": (20, 20)},
+            "left_hand": (30, 30),
+            "mana_point": (40, 40),
+            "mana_color": (1, 2, 3),
+            "start_slot": 1,
+        }
+        recorder.backpack_names = ["bp1", "bp2"]
+        recorder.automation_slot = 7
+        recorder.automation_backpack = 1
+        recorder.automation_stop = threading.Event()
+        recorder.background_pause = threading.Event()
+        recorder.background_enabled = SimpleNamespace(get=lambda: False)
+        recorder.events = []
+        recorder.status = SimpleNamespace(set=lambda *_args: None)
+        recorder._read_profile_fields = lambda: None
+        recorder.root = SimpleNamespace()
+        thread = Mock(return_value=SimpleNamespace(start=Mock()))
+
+        with patch.object(macro_recorder, "ImageGrab", object()):
+            with patch.object(macro_recorder, "threading", SimpleNamespace(Thread=thread)):
+                recorder.start_automation()
+
+        self.assertTrue(recorder.automation_running)
+        self.assertEqual(recorder.automation_slot, 7)
+        self.assertEqual(recorder.automation_backpack, 1)
+        thread.return_value.start.assert_called_once()
 
 
 if __name__ == "__main__":

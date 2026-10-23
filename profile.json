@@ -1,26 +1,15 @@
 {
   "mana_threshold_percent": 80.0,
   "mana_point": [
-    1375,
+    1388,
     240
   ],
   "mana_color": [
-    39,
-    39,
-    53
+    57,
+    55,
+    100
   ],
   "mana_color_tolerance": 35,
-  "logout_color": [
-    37,
-    31,
-    32
-  ],
-  "logout_point": [
-    390,
-    78
-  ],
-  "logout_tolerance": 35,
-  "mouse_speed": 1.0,
   "slot_width": 34,
   "slot_height": 34,
   "start_slot": 1,
@@ -50,6 +39,17 @@
   ],
   "cast_key": "f5",
   "cast_delay": 1.0,
+  "logout_color": [
+    37,
+    31,
+    32
+  ],
+  "logout_point": [
+    390,
+    78
+  ],
+  "logout_tolerance": 35,
+  "mouse_speed": 1.0,
   "mana_region": null,
   "bp3": {
     "first_slot": [

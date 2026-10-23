@@ -413,6 +413,8 @@ class MacroRecorder:
             self._rebuild_backpack_buttons()
             self.threshold_var.set(str(self.profile.get("mana_threshold_percent", 80)))
             self.slot_size_var.set(f"{self.profile.get('slot_width', 34)} x {self.profile.get('slot_height', 34)}")
+            self.automation_slot = int(self.profile.get("start_slot", 1))
+            self.automation_backpack = 0
             self._update_profile_status()
             self.status.set(f"Loaded profile: {Path(filename).name}")
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as error:
@@ -521,8 +523,6 @@ class MacroRecorder:
         if any(value is None for value in required):
             messagebox.showwarning("Rune automation", "Calibrate every backpack, the left hand, mana point, and mana color first.")
             return
-        self.automation_slot = int(self.profile.get("start_slot", 1))
-        self.automation_backpack = 0
         self.automation_running = True
         self.automation_stop.clear()
         self.background_pause.clear()
