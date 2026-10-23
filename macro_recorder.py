@@ -20,7 +20,11 @@ from __future__ import annotations
 import threading
 import time
 import json
+import os
 import re
+import subprocess
+import tempfile
+import fcntl
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +33,14 @@ from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
 
 try:
-    from PIL import ImageGrab
+    import Quartz
 except ImportError:
+    Quartz = None  # type: ignore[assignment]
+
+try:
+    from PIL import Image, ImageGrab
+except ImportError:
+    Image = None  # type: ignore[assignment]
     ImageGrab = None  # type: ignore[assignment]
 
 try:
@@ -47,12 +57,14 @@ class MacroRecorder:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Macro Recorder")
-        self.root.geometry("720x700")
-        self.root.minsize(620, 560)
+        self.root.geometry("820x800")
+        self.root.minsize(720, 700)
 
         self.mouse_controller = mouse.Controller()
         self.keyboard_controller = keyboard.Controller()
         self.events: list[dict[str, Any]] = []
+        self.events_lock = threading.Lock()
+        self.event_refresh_pending = False
         self.recording = False
         self.playing = False
         self.stop_playback = threading.Event()
@@ -65,8 +77,18 @@ class MacroRecorder:
         self.background_thread: threading.Thread | None = None
         self.background_held_keys: set[Key | KeyCode] = set()
         self.background_held_buttons: set[Button] = set()
+        self.background_button_positions: dict[Button, tuple[int, int]] = {}
         self.automation_backpack = 0
         self.automation_slot = 1
+        self.automation_target_pid: int | None = None
+        self.automation_target_window_id: int | None = None
+        self.automation_focus_interval = 10.0
+        self.last_focus_time = 0.0
+        self.focus_input_mutex = threading.RLock()
+        self.focus_input_owner: int | None = None
+        self.focus_lock_held = False
+        self.focus_lock_file = Path(tempfile.gettempdir(), "macro_recorder_focus.lock").open("a+")
+        self.background_targets: dict[str, tuple[int, int]] = {}
         self.backpack_names = ["bp1", "bp2"]
         self.profile: dict[str, Any] = {
             "mana_threshold_percent": 80,
@@ -87,6 +109,8 @@ class MacroRecorder:
         self.slot_size_var = tk.StringVar(value="34 x 34")
         self.profile_status = tk.StringVar(value="Profile not calibrated")
         self.background_enabled = tk.BooleanVar(value=False)
+        self.background_target_var = tk.StringVar(value="Foreground input")
+        self.focus_interval_var = tk.StringVar(value="10")
 
         self.status = tk.StringVar(value="Ready")
         self.event_count = tk.StringVar(value="0 events")
@@ -104,6 +128,7 @@ class MacroRecorder:
         self.mouse_listener.start()
         self.keyboard_listener.start()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._refresh_background_targets()
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=18)
@@ -154,9 +179,28 @@ class MacroRecorder:
         ttk.Button(automation, text="Start automation", command=self.start_automation).grid(row=0, column=3, padx=(12, 5))
         ttk.Button(automation, text="Stop automation", command=self.stop_automation).grid(row=0, column=4)
         ttk.Checkbutton(automation, text="Loop loaded fishing/eating recording while waiting", variable=self.background_enabled).grid(row=1, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        target_row = ttk.Frame(automation)
+        target_row.grid(row=2, column=0, columnspan=5, sticky="w", pady=(7, 0))
+        ttk.Label(target_row, text="Window to focus:").pack(side="left")
+        self.background_target_menu = ttk.Combobox(
+            target_row,
+            width=42,
+            textvariable=self.background_target_var,
+            state="readonly",
+            values=("Foreground input",),
+        )
+        self.background_target_menu.pack(side="left", padx=(6, 6))
+        ttk.Button(target_row, text="Refresh windows", command=self._refresh_background_targets).pack(side="left")
+        ttk.Label(target_row, text="Refocus every (sec):").pack(side="left", padx=(12, 4))
+        ttk.Entry(target_row, width=6, textvariable=self.focus_interval_var).pack(side="left")
+        ttk.Label(
+            automation,
+            text="Selected window receives normal foreground mouse and keyboard input.",
+            foreground="#666666",
+        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         calibration = ttk.Frame(automation)
-        calibration.grid(row=2, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        calibration.grid(row=4, column=0, columnspan=5, sticky="w", pady=(10, 0))
         self.backpack_calibration_frame = ttk.Frame(calibration)
         self.backpack_calibration_frame.grid(row=0, column=0, columnspan=2, sticky="w")
         self._rebuild_backpack_buttons()
@@ -169,9 +213,213 @@ class MacroRecorder:
         ]
         for index, (label, command) in enumerate(other_calibration_buttons):
             ttk.Button(calibration, text=label, command=command).grid(row=2 + index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=2)
-        ttk.Label(automation, textvariable=self.profile_status, foreground="#666666").grid(row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Button(automation, text="Test mana point", command=self.test_mana_point).grid(row=4, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(automation, text="Reset held keys", command=self.release_stuck_inputs).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(automation, textvariable=self.profile_status, foreground="#666666").grid(row=5, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Button(automation, text="Test mana point", command=self.test_mana_point).grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(automation, text="Reset held keys", command=self.release_stuck_inputs).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+    def _refresh_background_targets(self) -> None:
+        if Quartz is None:
+            return
+        try:
+            windows = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID,
+            )
+        except Exception as error:
+            messagebox.showerror("Background target", f"Could not list windows: {error}")
+            return
+
+        targets: dict[str, tuple[int, int]] = {}
+        for window in windows or []:
+            pid = int(window.get(Quartz.kCGWindowOwnerPID, 0))
+            window_id = int(window.get(Quartz.kCGWindowNumber, 0))
+            if pid <= 0 or pid == os.getpid() or window_id <= 0 or int(window.get(Quartz.kCGWindowLayer, -1)) != 0:
+                continue
+            bounds = window.get(Quartz.kCGWindowBounds, {})
+            if float(bounds.get("Width", 0)) <= 0 or float(bounds.get("Height", 0)) <= 0:
+                continue
+            owner = window.get(Quartz.kCGWindowOwnerName, "Application")
+            title = window.get(Quartz.kCGWindowName) or "Window"
+            label = f"{owner} — {title} (PID {pid}, window {window_id})"
+            targets[label] = (pid, window_id)
+
+        current = self.background_target_var.get()
+        self.background_targets = targets
+        values = ("Foreground input", *targets.keys())
+        self.background_target_menu.configure(values=values)
+        self.background_target_var.set(current if current in targets else "Foreground input")
+
+    def _selected_background_target(self) -> tuple[int, int] | None:
+        selection = self.background_target_var.get()
+        return self.background_targets.get(selection)
+
+    def _focus_target_window(self, pid: int, window_id: int) -> None:
+        if Quartz is None:
+            raise RuntimeError("Window focusing requires macOS Quartz")
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        window = next(
+            (
+                item
+                for item in windows or []
+                if int(item.get(Quartz.kCGWindowOwnerPID, 0)) == pid
+                and int(item.get(Quartz.kCGWindowNumber, 0)) == window_id
+            ),
+            None,
+        )
+        if window is None:
+            raise RuntimeError("The selected window is no longer available; refresh the window list")
+
+        title = str(window.get(Quartz.kCGWindowName, ""))
+        escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            'tell application "System Events"\n'
+            f"set targetProcess to first application process whose unix id is {pid}\n"
+            "set frontmost of targetProcess to true\n"
+            "try\n"
+            f'set targetWindow to first window of targetProcess whose name is "{escaped_title}"\n'
+            'perform action "AXRaise" of targetWindow\n'
+            "end try\n"
+            "end tell"
+        )
+        try:
+            subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            details = getattr(error, "stderr", None) or str(error)
+            raise RuntimeError(
+                f"Could not focus the selected window. Enable Accessibility access for "
+                f"System Events/osascript in macOS Privacy & Security settings. {details}"
+            ) from error
+
+    def _acquire_focus_file_lock(self) -> None:
+        if self.focus_lock_held:
+            return
+        fcntl.flock(self.focus_lock_file.fileno(), fcntl.LOCK_EX)
+        self.focus_lock_held = True
+
+    def _release_focus_file_lock(self) -> None:
+        if self.focus_lock_held:
+            fcntl.flock(self.focus_lock_file.fileno(), fcntl.LOCK_UN)
+            self.focus_lock_held = False
+
+    def _ensure_target_focused(self, force: bool = False) -> None:
+        if self.automation_target_pid is None or self.automation_target_window_id is None:
+            return
+        self._acquire_focus_file_lock()
+        self.focus_lock_file.seek(0)
+        try:
+            state = json.loads(self.focus_lock_file.read() or "{}")
+        except json.JSONDecodeError:
+            state = {}
+        target = [self.automation_target_pid, self.automation_target_window_id]
+        now = time.monotonic()
+        last_focused = float(state.get("focused_at", 0.0))
+        if force or state.get("target") != target or now - last_focused >= self.automation_focus_interval:
+            self._focus_target_window(*target)
+            state = {"target": target, "focused_at": now}
+            self.focus_lock_file.seek(0)
+            self.focus_lock_file.truncate()
+            json.dump(state, self.focus_lock_file)
+            self.focus_lock_file.flush()
+            self.last_focus_time = now
+
+    def _begin_focused_input(self) -> None:
+        if self.automation_target_pid is None:
+            return
+        owner = threading.get_ident()
+        if self.focus_input_owner != owner:
+            self.focus_input_mutex.acquire()
+            self.focus_input_owner = owner
+            try:
+                self._acquire_focus_file_lock()
+            except Exception:
+                self.focus_input_owner = None
+                self.focus_input_mutex.release()
+                raise
+        try:
+            self._ensure_target_focused()
+        except Exception:
+            self._release_focused_input()
+            raise
+
+    def _release_focused_input(self) -> None:
+        if self.focus_input_owner == threading.get_ident():
+            self._release_focus_file_lock()
+            self.focus_input_owner = None
+            self.focus_input_mutex.release()
+
+    def _focus_target_if_due(self) -> None:
+        if (
+            self.automation_target_pid is None
+            or time.monotonic() - self.last_focus_time < self.automation_focus_interval
+        ):
+            return
+        with self.focus_input_mutex:
+            self._acquire_focus_file_lock()
+            try:
+                self._ensure_target_focused(force=True)
+            finally:
+                self._release_focus_file_lock()
+
+    def _target_window_image(self, window_id: int) -> tuple[Any, dict[str, float]]:
+        if Quartz is None or Image is None:
+            raise RuntimeError("Background window capture requires macOS Quartz and Pillow")
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        window = next(
+            (item for item in windows or [] if int(item.get(Quartz.kCGWindowNumber, 0)) == window_id),
+            None,
+        )
+        if window is None:
+            raise RuntimeError("The selected background window is no longer available; refresh the window list")
+        bounds = window.get(Quartz.kCGWindowBounds, {})
+        image_ref = Quartz.CGWindowListCreateImage(
+            Quartz.CGRectNull,
+            Quartz.kCGWindowListOptionIncludingWindow,
+            window_id,
+            Quartz.kCGWindowImageBestResolution,
+        )
+        if image_ref is None:
+            raise RuntimeError("Could not capture the selected window; check Screen Recording permission")
+        width = Quartz.CGImageGetWidth(image_ref)
+        height = Quartz.CGImageGetHeight(image_ref)
+        row_bytes = Quartz.CGImageGetBytesPerRow(image_ref)
+        data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(image_ref))
+        bitmap = Image.frombytes("RGBA", (width, height), bytes(data), "raw", "BGRA", row_bytes)
+        return bitmap.convert("RGB"), bounds
+
+    def _sample_pixel(self, point: tuple[int, int] | list[int]) -> tuple[int, int, int]:
+        target = (
+            (self.automation_target_pid, self.automation_target_window_id)
+            if self.automation_target_pid is not None and self.automation_target_window_id is not None
+            else self._selected_background_target()
+        )
+        if target is None:
+            if ImageGrab is None:
+                raise RuntimeError("Install Pillow first: pip install Pillow")
+            x, y = map(int, point)
+            image = ImageGrab.grab(bbox=(x, y, x + 1, y + 1)).convert("RGB")
+            return tuple(next(iter(image.getdata())))
+
+        _, window_id = target
+        image, bounds = self._target_window_image(window_id)
+        scale_x = image.width / float(bounds["Width"])
+        scale_y = image.height / float(bounds["Height"])
+        x = int((float(point[0]) - float(bounds["X"])) * scale_x)
+        y = int((float(point[1]) - float(bounds["Y"])) * scale_y)
+        if not (0 <= x < image.width and 0 <= y < image.height):
+            raise RuntimeError("Mana calibration point is outside the selected background window")
+        return image.getpixel((x, y))
 
     def _record_event(self, event: dict[str, Any]) -> None:
         if not self.recording or self.playing:
@@ -179,8 +427,12 @@ class MacroRecorder:
         now = time.monotonic()
         event["delay"] = 0.0 if self.last_event_time is None else min(now - self.last_event_time, 30.0)
         self.last_event_time = now
-        self.events.append(event)
-        self.root.after(0, self._refresh_events)
+        with self.events_lock:
+            self.events.append(event)
+            if self.event_refresh_pending:
+                return
+            self.event_refresh_pending = True
+        self.root.after(200, self._refresh_events)
 
     def _on_move(self, x: int, y: int) -> None:
         # Sample movement rather than recording every OS mouse event.
@@ -319,8 +571,12 @@ class MacroRecorder:
         self.status.set("Ready")
 
     def _refresh_events(self) -> None:
+        with self.events_lock:
+            self.event_refresh_pending = False
+            events = self.events[-200:]
+            event_count = len(self.events)
         self.events_view.delete(0, tk.END)
-        for event in self.events[-500:]:
+        for event in events:
             kind = event["type"]
             if kind in ("key_down", "key_up"):
                 label = f"{kind}: {event['key']['value']}"
@@ -331,7 +587,7 @@ class MacroRecorder:
             else:
                 label = f"scroll: ({event['dx']}, {event['dy']})"
             self.events_view.insert(tk.END, label)
-        self.event_count.set(f"{len(self.events)} event{'s' if len(self.events) != 1 else ''}")
+        self.event_count.set(f"{event_count} event{'s' if event_count != 1 else ''}")
         self.events_view.yview_moveto(1.0)
 
     def close(self) -> None:
@@ -473,21 +729,21 @@ class MacroRecorder:
         self._capture_mana_color()
 
     def _capture_mana_color(self) -> None:
-        if ImageGrab is None:
+        if ImageGrab is None and (self._selected_background_target() is None or Image is None):
             messagebox.showerror("Mana color", "Install Pillow first: pip install Pillow")
             return
         x, y = [int(round(value)) for value in self.mouse_controller.position]
         try:
-            sample = ImageGrab.grab(bbox=(x, y, x + 1, y + 1)).convert("RGB")
+            color = self._sample_pixel((x, y))
         except Exception as error:
             messagebox.showerror(
                 "Mana color",
-                "Could not capture the screen at that position. "
-                "Check Screen Recording permission for Python/Terminal, then retry.\n\n"
+                "Could not capture the selected pixel. Check Screen Recording permission, "
+                "then retry.\n\n"
                 f"{type(error).__name__}: {error}",
             )
             return
-        self.profile["mana_color"] = list(next(iter(sample.getdata())))
+        self.profile["mana_color"] = list(color)
         self.status.set(f"Mana color captured: {tuple(self.profile['mana_color'])}")
         self._update_profile_status()
 
@@ -510,11 +766,18 @@ class MacroRecorder:
     def start_automation(self) -> None:
         if self.recording or self.playing or self.automation_running:
             return
-        if ImageGrab is None:
+        target = self._selected_background_target()
+        if target is None and ImageGrab is None:
             messagebox.showerror("Rune automation", "Install Pillow first: pip install Pillow")
+            return
+        if target is not None and (Quartz is None or Image is None):
+            messagebox.showerror("Rune automation", "Window focusing requires macOS Quartz and Pillow")
             return
         try:
             self._read_profile_fields()
+            focus_interval = float(self.focus_interval_var.get())
+            if not 1 <= focus_interval <= 3600:
+                raise ValueError("Refocus interval must be between 1 and 3600 seconds")
         except ValueError as error:
             messagebox.showerror("Rune automation", str(error))
             return
@@ -523,6 +786,19 @@ class MacroRecorder:
         if any(value is None for value in required):
             messagebox.showwarning("Rune automation", "Calibrate every backpack, the left hand, mana point, and mana color first.")
             return
+        self.automation_target_pid, self.automation_target_window_id = target or (None, None)
+        self.automation_focus_interval = focus_interval
+        self.last_focus_time = 0.0
+        if target is not None:
+            try:
+                self._ensure_target_focused(force=True)
+            except Exception as error:
+                self._release_focus_file_lock()
+                self.automation_target_pid = None
+                self.automation_target_window_id = None
+                messagebox.showerror("Rune automation", str(error))
+                return
+            self._release_focus_file_lock()
         self.automation_running = True
         self.automation_stop.clear()
         self.background_pause.clear()
@@ -533,7 +809,7 @@ class MacroRecorder:
         threading.Thread(target=self._automation_loop, daemon=True).start()
 
     def test_mana_point(self) -> None:
-        if ImageGrab is None:
+        if ImageGrab is None and (self._selected_background_target() is None or Image is None):
             messagebox.showerror("Mana test", "Install Pillow first: pip install Pillow")
             return
         if not self.profile.get("mana_point") or not self.profile.get("mana_color"):
@@ -554,6 +830,7 @@ class MacroRecorder:
     def _automation_loop(self) -> None:
         try:
             while not self.automation_stop.is_set():
+                self._focus_target_if_due()
                 mana = self._read_mana_percent()
                 if mana >= 100.0:
                     self.background_pause.set()
@@ -578,80 +855,109 @@ class MacroRecorder:
 
     def _background_loop(self) -> None:
         """Loop a separately recorded fishing/eating macro while mana is low."""
-        while not self.automation_stop.is_set():
-            for recorded_event in self.events:
-                if self.automation_stop.is_set():
-                    return
-                while self.background_pause.is_set() and not self.automation_stop.is_set():
-                    time.sleep(0.05)
-                remaining = float(recorded_event.get("delay", 0.0))
-                while remaining > 0 and not self.automation_stop.is_set():
-                    if self.background_pause.is_set():
+        try:
+            while not self.automation_stop.is_set():
+                for recorded_event in self.events:
+                    if self.automation_stop.is_set():
+                        return
+                    while (
+                        self.background_pause.is_set()
+                        and not self.automation_stop.is_set()
+                        and not self.background_held_buttons
+                        and not self.background_held_keys
+                    ):
                         time.sleep(0.05)
-                        continue
-                    pause = min(remaining, 0.05)
-                    time.sleep(pause)
-                    remaining -= pause
-                if not self.background_pause.is_set() and not self.automation_stop.is_set():
-                    self._perform_event(recorded_event)
+                    remaining = float(recorded_event.get("delay", 0.0))
+                    while remaining > 0 and not self.automation_stop.is_set():
+                        if (
+                            self.background_pause.is_set()
+                            and not self.background_held_buttons
+                            and not self.background_held_keys
+                        ):
+                            time.sleep(0.05)
+                            continue
+                        pause = min(remaining, 0.05)
+                        time.sleep(pause)
+                        remaining -= pause
+                    if (
+                        (not self.background_pause.is_set() or self.background_held_buttons or self.background_held_keys)
+                        and not self.automation_stop.is_set()
+                    ):
+                        self._perform_event(recorded_event)
+        finally:
+            if self.background_held_buttons or self.background_held_keys:
+                self.release_stuck_inputs()
 
     def _perform_event(self, recorded_event: dict[str, Any]) -> None:
         kind = recorded_event["type"]
-        if kind == "move":
-            self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
-        elif kind == "click":
-            self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
-            button = Button[recorded_event["button"]]
-            action = self.mouse_controller.press if recorded_event["pressed"] else self.mouse_controller.release
-            action(button)
-            if recorded_event["pressed"]:
-                self.background_held_buttons.add(button)
-            else:
-                self.background_held_buttons.discard(button)
-        elif kind == "scroll":
-            self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
-            self.mouse_controller.scroll(recorded_event["dx"], recorded_event["dy"])
-        elif kind == "key_down":
-            key = self._deserialize_key(recorded_event["key"])
-            self.keyboard_controller.press(key)
-            self.background_held_keys.add(key)
-        elif kind == "key_up":
-            key = self._deserialize_key(recorded_event["key"])
-            self.keyboard_controller.release(key)
-            self.background_held_keys.discard(key)
+        self._begin_focused_input()
+        try:
+            if kind == "move":
+                self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
+            elif kind == "click":
+                self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
+                button = Button[recorded_event["button"]]
+                action = self.mouse_controller.press if recorded_event["pressed"] else self.mouse_controller.release
+                action(button)
+                if recorded_event["pressed"]:
+                    self.background_held_buttons.add(button)
+                    self.background_button_positions[button] = (
+                        recorded_event["x"],
+                        recorded_event["y"],
+                    )
+                else:
+                    self.background_held_buttons.discard(button)
+                    self.background_button_positions.pop(button, None)
+            elif kind == "scroll":
+                self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
+                self.mouse_controller.scroll(recorded_event["dx"], recorded_event["dy"])
+            elif kind == "key_down":
+                key = self._deserialize_key(recorded_event["key"])
+                self.keyboard_controller.press(key)
+                self.background_held_keys.add(key)
+            elif kind == "key_up":
+                key = self._deserialize_key(recorded_event["key"])
+                self.keyboard_controller.release(key)
+                self.background_held_keys.discard(key)
+        finally:
+            if not self.background_held_buttons and not self.background_held_keys:
+                self._release_focused_input()
 
     def release_stuck_inputs(self) -> None:
         """Release keys/buttons left down by a paused background recording."""
-        keys = set(self.background_held_keys)
-        for name in ("ctrl", "ctrl_l", "ctrl_r", "shift", "shift_l", "shift_r", "alt", "alt_l", "alt_r", "cmd", "cmd_l", "cmd_r"):
-            key = getattr(Key, name, None)
-            if key is not None:
-                keys.add(key)
-        for key in keys:
-            try:
-                self.keyboard_controller.release(key)
-            except Exception:
-                pass
-        for button in set(self.background_held_buttons) | {Button.left, Button.right, Button.middle}:
-            try:
-                self.mouse_controller.release(button)
-            except Exception:
-                pass
-        self.background_held_keys.clear()
-        self.background_held_buttons.clear()
+        self._begin_focused_input()
+        try:
+            keys = set(self.background_held_keys)
+            for name in ("ctrl", "ctrl_l", "ctrl_r", "shift", "shift_l", "shift_r", "alt", "alt_l", "alt_r", "cmd", "cmd_l", "cmd_r"):
+                key = getattr(Key, name, None)
+                if key is not None:
+                    keys.add(key)
+            for key in keys:
+                try:
+                    self.keyboard_controller.release(key)
+                except Exception:
+                    pass
+            for button in set(self.background_held_buttons) | {Button.left, Button.right, Button.middle}:
+                try:
+                    self.mouse_controller.release(button)
+                except Exception:
+                    pass
+            self.background_held_keys.clear()
+            self.background_held_buttons.clear()
+            self.background_button_positions.clear()
+        finally:
+            self._release_focused_input()
 
     def _read_mana_percent(self) -> float:
         point = self.profile.get("mana_point")
         if not point:
             raise RuntimeError("Mana point is not calibrated")
-        x, y = map(int, point)
         try:
-            image = ImageGrab.grab(bbox=(x, y, x + 1, y + 1)).convert("RGB")
+            current_color = self._sample_pixel(point)
         except Exception as error:
-            raise RuntimeError("Screen capture failed; enable Screen Recording permission for Python/Terminal") from error
+            raise RuntimeError(f"Could not read mana pixel: {error}") from error
         if not self.profile.get("mana_color"):
             raise RuntimeError("Mana color is not calibrated")
-        current_color = tuple(next(iter(image.getdata())))
         target_color = tuple(self.profile["mana_color"])
         return 100.0 if current_color == target_color else 0.0
 
@@ -677,19 +983,40 @@ class MacroRecorder:
         slot_y = int(round(first_y + (self.automation_slot // columns) * int(self.profile.get("slot_height", 34))))
         hand_x, hand_y = [int(round(value)) for value in self.profile["left_hand"]]
         self.root.after(0, lambda: self.status.set(f"Dragging {backpack_name} slot {self.automation_slot + 1}"))
-        self.mouse_controller.position = (slot_x, slot_y)
-        time.sleep(0.25)
-        self.mouse_controller.press(Button.left)
+        self._begin_focused_input()
         try:
+            self._move_mouse(slot_x, slot_y)
+            time.sleep(0.25)
+            self._mouse_button("left", True, slot_x, slot_y)
             time.sleep(0.25)
             self.mouse_controller.move(hand_x - slot_x, hand_y - slot_y)
             time.sleep(0.25)
+            self._mouse_button("left", False, hand_x, hand_y)
+            self.keyboard_controller.press(Key.f5)
+            self.keyboard_controller.release(Key.f5)
+            self.automation_slot += 1
+            return True
         finally:
-            self.mouse_controller.release(Button.left)
-        self.keyboard_controller.press(Key.f5)
-        self.keyboard_controller.release(Key.f5)
-        self.automation_slot += 1
-        return True
+            if Button.left in self.background_held_buttons:
+                self.mouse_controller.release(Button.left)
+                self.background_held_buttons.discard(Button.left)
+                self.background_button_positions.pop(Button.left, None)
+            self._release_focused_input()
+
+    def _move_mouse(self, x: int, y: int) -> None:
+        self.mouse_controller.position = (x, y)
+
+    def _mouse_button(self, button: str, pressed: bool, x: int, y: int) -> None:
+        self.mouse_controller.position = (x, y)
+        mouse_button = Button[button]
+        action = self.mouse_controller.press if pressed else self.mouse_controller.release
+        action(mouse_button)
+        if pressed:
+            self.background_held_buttons.add(mouse_button)
+            self.background_button_positions[mouse_button] = (x, y)
+        else:
+            self.background_held_buttons.discard(mouse_button)
+            self.background_button_positions.pop(mouse_button, None)
 
 
 def main() -> None:
