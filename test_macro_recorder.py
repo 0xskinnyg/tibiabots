@@ -2,6 +2,7 @@ import sys
 import json
 import tempfile
 import threading
+import time
 import types
 import unittest
 from types import SimpleNamespace
@@ -100,6 +101,91 @@ class MacroRecorderColorTests(unittest.TestCase):
         macro_recorder.ImageGrab = original_grab
         macro_recorder.mouse = original_mouse
 
+    def test_focused_selected_window_samples_actual_screen_pixel(self):
+        original_image_grab = macro_recorder.ImageGrab
+        original_quartz = macro_recorder.Quartz
+        original_appkit = macro_recorder.AppKit
+        screen_grab = Mock(return_value=FakeGrab([(21, 31, 41)]))
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowNumber="window_id",
+            kCGWindowOwnerPID="pid",
+            kCGWindowBounds="bounds",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {
+                    "window_id": 456,
+                    "pid": 123,
+                    "bounds": {"X": 100, "Y": 200, "Width": 800, "Height": 600},
+                }
+            ],
+        )
+        frontmost_app = SimpleNamespace(processIdentifier=lambda: 123)
+        fake_appkit = SimpleNamespace(
+            NSWorkspace=SimpleNamespace(
+                sharedWorkspace=lambda: SimpleNamespace(
+                    frontmostApplication=lambda: frontmost_app
+                )
+            )
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.automation_target_pid = None
+        recorder.automation_target_window_id = None
+        recorder.background_target_var = SimpleNamespace(get=lambda: "Game")
+        recorder.background_targets = {"Game": (123, 456)}
+        recorder._target_window_image = Mock(side_effect=AssertionError("should use screen pixel"))
+        macro_recorder.ImageGrab = SimpleNamespace(grab=screen_grab)
+        macro_recorder.Quartz = fake_quartz
+        macro_recorder.AppKit = fake_appkit
+        try:
+            sampled = recorder._sample_pixel((120, 230))
+        finally:
+            macro_recorder.ImageGrab = original_image_grab
+            macro_recorder.Quartz = original_quartz
+            macro_recorder.AppKit = original_appkit
+
+        self.assertEqual(sampled, (21, 31, 41))
+        screen_grab.assert_called_once_with(bbox=(120, 230, 121, 231))
+        recorder._target_window_image.assert_not_called()
+
+    def test_capture_uses_calibrated_mana_point_when_cursor_is_outside_selected_window(self):
+        original_image_grab = macro_recorder.ImageGrab
+        original_image = macro_recorder.Image
+        original_messagebox = macro_recorder.messagebox
+        errors = []
+        statuses = []
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.profile = {
+            "mana_point": [120, 230],
+            "mana_color": None,
+        }
+        recorder.automation_target_pid = None
+        recorder.automation_target_window_id = None
+        recorder.mouse_controller = SimpleNamespace(position=(700, 800))
+        recorder.background_target_var = SimpleNamespace(get=lambda: "Selected game")
+        recorder.background_targets = {"Selected game": (123, 456)}
+        recorder._target_process_is_frontmost = Mock(return_value=False)
+        recorder.status = SimpleNamespace(set=statuses.append)
+        recorder._update_profile_status = Mock()
+        recorder._sample_pixel = Mock(return_value=(20, 30, 40))
+        macro_recorder.ImageGrab = object()
+        macro_recorder.Image = object()
+        macro_recorder.messagebox = SimpleNamespace(showerror=lambda *args: errors.append(args))
+
+        try:
+            recorder._capture_mana_color()
+        finally:
+            macro_recorder.ImageGrab = original_image_grab
+            macro_recorder.Image = original_image
+            macro_recorder.messagebox = original_messagebox
+
+        recorder._sample_pixel.assert_called_once_with([120, 230])
+        self.assertEqual(recorder.profile["mana_color"], [20, 30, 40])
+        self.assertIn("at the calibrated mana point", statuses[0])
+        self.assertEqual(errors, [])
+        recorder._update_profile_status.assert_called_once()
+
 
 class MacroRecorderAutomationTests(unittest.TestCase):
     def test_start_automation_prepares_every_session_before_launching(self):
@@ -113,6 +199,9 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             for number in (1, 2, 3)
         }
         recorder._session_context = threading.local()
+        recorder._active_session_id = "session-2"
+        recorder._coordinator_stop = threading.Event()
+        recorder._coordinator_thread = None
         operations = []
         recorder._prepare_automation = Mock(
             side_effect=lambda: operations.append(
@@ -126,7 +215,13 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             )
         )
 
-        recorder.start_automation()
+        fake_thread = SimpleNamespace(start=Mock(), is_alive=Mock(return_value=False))
+        with patch.object(
+            macro_recorder.threading,
+            "Thread",
+            return_value=fake_thread,
+        ) as thread_factory:
+            recorder.start_automation()
 
         self.assertEqual(
             operations,
@@ -139,6 +234,259 @@ class MacroRecorderAutomationTests(unittest.TestCase):
                 ("launch", "session-3"),
             ],
         )
+        fake_thread.start.assert_called_once()
+        thread_factory.assert_called_once_with(
+            target=recorder._automation_coordinator,
+            args=(tuple(recorder._sessions),),
+            daemon=True,
+        )
+
+    def test_automation_coordinator_visits_sessions_in_order(self):
+        session_ids = ("session-1", "session-2")
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            session_id: macro_recorder.MacroSession(
+                session_id,
+                session_id,
+                {
+                    "automation_running": True,
+                    "background_running": False,
+                    "automation_stop": threading.Event(),
+                    "background_stop": threading.Event(),
+                    "background_error": None,
+                    "rune_error": None,
+                },
+            )
+            for session_id in session_ids
+        }
+        recorder._session_context = threading.local()
+        recorder._active_session_id = session_ids[0]
+        recorder._coordinator_stop = threading.Event()
+        recorder._schedule_in_session = Mock()
+        recorder._run_in_session = macro_recorder.MacroRecorder._run_in_session.__get__(
+            recorder, macro_recorder.MacroRecorder
+        )
+        visited = []
+
+        def visit_session():
+            visited.append(recorder._session_context.session_id)
+            if len(visited) == len(session_ids):
+                for state in recorder._sessions.values():
+                    state.state["automation_stop"].set()
+                    state.state["background_stop"].set()
+
+        recorder._run_session_turn = visit_session
+
+        recorder._automation_coordinator(session_ids)
+
+        self.assertEqual(visited, ["session-1", "session-2"])
+        self.assertTrue(all(not s.state["automation_running"] for s in recorder._sessions.values()))
+
+    def test_session_turn_plays_one_recording_pass_then_yields(self):
+        session_id = "session-1"
+        session = macro_recorder.MacroSession(
+            session_id,
+            "Session 1",
+            {
+                "automation_running": False,
+                "background_running": True,
+                "background_stop": threading.Event(),
+                "background_enabled": SimpleNamespace(get=lambda: True),
+                "events": [
+                    {"type": "move", "x": 1, "y": 2, "delay": 0},
+                    {"type": "move", "x": 3, "y": 4, "delay": 0},
+                ],
+                "next_recording_at": 0.0,
+                "recording_loop_interval": 0.0,
+                "session_turn_active": False,
+                "background_held_buttons": {DummyButton.left},
+                "background_held_keys": set(),
+            },
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {session_id: session}
+        recorder._active_session_id = session_id
+        recorder._session_context = threading.local()
+        recorder._coordinator_stop = threading.Event()
+        recorder._check_session_rune = Mock()
+        recorder._perform_event = Mock()
+        recorder.release_stuck_inputs = Mock()
+        recorder._schedule_in_session = Mock()
+        recorder._set_session_status = Mock()
+
+        recorder._run_in_session(session_id, recorder._run_session_turn)
+
+        self.assertEqual(recorder._perform_event.call_count, 2)
+        self.assertEqual(recorder._check_session_rune.call_count, 3)
+        self.assertGreater(session.state["next_recording_at"], 0)
+        self.assertFalse(session.state["session_turn_active"])
+        recorder.release_stuck_inputs.assert_called_once()
+        recorder._schedule_in_session.assert_called_once()
+
+    def test_session_turn_checks_due_timer_rune(self):
+        session_id = "session-1"
+        session = macro_recorder.MacroSession(
+            session_id,
+            "Session 1",
+            {
+                "automation_running": True,
+                "automation_stop": threading.Event(),
+                "automation_timed_runes": True,
+                "next_rune_at": 0.0,
+                "rune_interval": 60.0,
+                "background_held_buttons": set(),
+                "background_held_keys": set(),
+            },
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {session_id: session}
+        recorder._active_session_id = session_id
+        recorder._session_context = threading.local()
+        recorder._focus_target_if_due = Mock()
+        recorder._rune_once = Mock(return_value=True)
+        recorder._schedule_in_session = Mock()
+        recorder.release_stuck_inputs = Mock()
+
+        recorder._run_in_session(session_id, recorder._check_session_rune)
+
+        recorder._rune_once.assert_called_once()
+        self.assertGreater(session.state["next_rune_at"], time.monotonic())
+
+    def test_start_all_runs_background_recording_for_each_enabled_session(self):
+        sessions = {}
+        for number in (1, 2):
+            session_id = f"session-{number}"
+            sessions[session_id] = macro_recorder.MacroSession(
+                session_id,
+                f"Session {number}",
+                {
+                    "automation_running": False,
+                    "background_running": False,
+                    "automation_stop": threading.Event(),
+                    "background_pause": threading.Event(),
+                    "background_stop": threading.Event(),
+                    "status": SimpleNamespace(set=Mock()),
+                    "automation_timed_runes": False,
+                    "background_enabled": SimpleNamespace(get=lambda: True),
+                    "events": [{"type": "move"}],
+                },
+            )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = sessions
+        recorder._active_session_id = "session-2"
+        recorder._session_context = threading.local()
+        recorder._run_in_session = macro_recorder.MacroRecorder._run_in_session.__get__(
+            recorder, macro_recorder.MacroRecorder
+        )
+        recorder._coordinator_stop = threading.Event()
+        recorder._coordinator_thread = None
+        fake_thread = SimpleNamespace(start=Mock(), is_alive=Mock(return_value=False))
+        with patch.object(macro_recorder.threading, "Thread", return_value=fake_thread):
+            for session_id in ("session-1", "session-2"):
+                recorder._run_in_session(session_id, recorder._launch_automation)
+
+        self.assertTrue(sessions["session-1"].state["background_running"])
+        self.assertTrue(sessions["session-2"].state["background_running"])
+        self.assertIsNone(recorder._coordinator_thread)
+
+    def test_session_loop_waits_run_in_parallel(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._session_context = threading.local()
+        recorder._sessions = {}
+        waiting_barrier = threading.Barrier(2)
+
+        class BarrierStop:
+            def is_set(self):
+                return False
+
+            def wait(self, _timeout=None):
+                waiting_barrier.wait(timeout=1)
+                return False
+
+        for session_id in ("session-1", "session-2"):
+            recorder._sessions[session_id] = macro_recorder.MacroSession(
+                session_id,
+                session_id,
+                {
+                    "recording_loop_interval": 0.05,
+                    "automation_stop": threading.Event(),
+                    "background_stop": BarrierStop(),
+                    "background_pause": threading.Event(),
+                    "background_held_buttons": set(),
+                    "background_held_keys": set(),
+                },
+            )
+
+        completed = [threading.Event(), threading.Event()]
+        threads = [
+            threading.Thread(
+                target=lambda index=index, session_id=session_id: recorder._run_in_session(
+                    session_id,
+                    lambda: (
+                        recorder._wait_recording_loop_interval(),
+                        completed[index].set(),
+                    ),
+                )
+            )
+            for index, session_id in enumerate(("session-1", "session-2"))
+        ]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(completed[0].wait(timeout=1))
+        self.assertTrue(completed[1].wait(timeout=1))
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    def test_foreground_input_actions_still_take_exclusive_lock(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._session_context = threading.local()
+        recorder.focus_input_mutex = threading.RLock()
+        recorder.focus_input_owner = None
+        recorder.focus_lock_held = False
+        recorder._sessions = {
+            session_id: macro_recorder.MacroSession(
+                session_id,
+                session_id,
+                {
+                    "automation_target_pid": None,
+                    "automation_target_window_id": None,
+                },
+            )
+            for session_id in ("session-1", "session-2")
+        }
+        first_has_lock = threading.Event()
+        release_first = threading.Event()
+        second_has_lock = threading.Event()
+
+        def run_first():
+            def action():
+                recorder._begin_focused_input()
+                first_has_lock.set()
+                release_first.wait(timeout=1)
+                recorder._release_focused_input()
+            recorder._run_in_session("session-1", action)
+
+        def run_second():
+            def action():
+                recorder._begin_focused_input()
+                second_has_lock.set()
+                recorder._release_focused_input()
+            recorder._run_in_session("session-2", action)
+
+        first = threading.Thread(target=run_first)
+        second = threading.Thread(target=run_second)
+        first.start()
+        self.assertTrue(first_has_lock.wait(timeout=1))
+        second.start()
+        self.assertFalse(second_has_lock.wait(timeout=0.1))
+        release_first.set()
+        self.assertTrue(second_has_lock.wait(timeout=1))
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
 
     def test_start_automation_does_not_launch_any_session_if_one_fails_validation(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
@@ -159,8 +507,9 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder._prepare_automation.assert_has_calls([unittest.mock.call(), unittest.mock.call()])
         recorder._launch_automation.assert_not_called()
 
-    def test_stop_automation_signals_and_releases_every_running_session(self):
+    def test_stop_automation_signals_all_sessions_without_blocking_for_input_focus(self):
         stop_events = [threading.Event() for _ in range(3)]
+        background_stop_events = [threading.Event() for _ in range(3)]
         pause_events = [threading.Event() for _ in range(3)]
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
         recorder._sessions = {
@@ -170,26 +519,85 @@ class MacroRecorderAutomationTests(unittest.TestCase):
                 {
                     "automation_running": running,
                     "automation_stop": stop_events[number - 1],
+                    "background_stop": background_stop_events[number - 1],
                     "background_pause": pause_events[number - 1],
                 },
             )
             for number, running in ((1, True), (2, False), (3, True))
         }
         recorder._session_context = threading.local()
-        released = []
-        recorder.release_stuck_inputs = lambda: released.append(
-            recorder._session_context.session_id
-        )
+        recorder.release_stuck_inputs = Mock()
 
         recorder.stop_automation()
 
         self.assertTrue(stop_events[0].is_set())
-        self.assertFalse(stop_events[1].is_set())
+        self.assertTrue(stop_events[1].is_set())
         self.assertTrue(stop_events[2].is_set())
+        self.assertTrue(background_stop_events[0].is_set())
+        self.assertTrue(background_stop_events[1].is_set())
+        self.assertTrue(background_stop_events[2].is_set())
         self.assertTrue(pause_events[0].is_set())
-        self.assertFalse(pause_events[1].is_set())
+        self.assertTrue(pause_events[1].is_set())
         self.assertTrue(pause_events[2].is_set())
-        self.assertEqual(released, ["session-1", "session-3"])
+        recorder.release_stuck_inputs.assert_not_called()
+
+    def test_f11_signals_every_worker_before_scheduling_ui_stop(self):
+        sessions = {
+            f"session-{number}": macro_recorder.MacroSession(
+                f"session-{number}",
+                f"Session {number}",
+                {
+                    "automation_stop": threading.Event(),
+                    "background_stop": threading.Event(),
+                    "background_pause": threading.Event(),
+                    "stop_playback": threading.Event(),
+                },
+            )
+            for number in (1, 2)
+        }
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = sessions
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
+        recorder._coordinator_stop = threading.Event()
+        recorder._schedule_in_session = Mock()
+
+        recorder._on_press(DummyKey.f11)
+
+        for session in sessions.values():
+            self.assertTrue(session.state["automation_stop"].is_set())
+            self.assertTrue(session.state["background_stop"].is_set())
+            self.assertTrue(session.state["background_pause"].is_set())
+            self.assertTrue(session.state["stop_playback"].is_set())
+        recorder._schedule_in_session.assert_called_once_with(
+            "session-1",
+            recorder.stop,
+        )
+
+    def test_release_stuck_inputs_does_not_wait_for_window_focus(self):
+        key = DummyKey("a")
+        keyboard_controller = SimpleNamespace(release=Mock())
+        mouse_controller = SimpleNamespace(release=Mock())
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.background_held_keys = {key}
+        recorder.background_held_buttons = {DummyButton.left}
+        recorder.background_button_positions = {DummyButton.left: (10, 20)}
+        recorder.keyboard_controller = keyboard_controller
+        recorder.mouse_controller = mouse_controller
+        recorder.automation_target_pid = None
+        recorder.automation_target_window_id = None
+        recorder.focus_input_mutex = threading.RLock()
+        recorder.focus_input_owner = None
+        recorder.focus_lock_held = False
+        recorder._focus_target_window = Mock()
+
+        recorder.release_stuck_inputs()
+
+        keyboard_controller.release.assert_called_with(key)
+        mouse_controller.release.assert_any_call(DummyButton.left)
+        self.assertFalse(recorder.background_held_keys)
+        self.assertFalse(recorder.background_held_buttons)
+        recorder._focus_target_window.assert_not_called()
 
     def test_new_session_gets_unique_numbered_name(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
@@ -229,6 +637,7 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             ),
         }
         recorder._active_session_id = "session-1"
+        recorder._global_focus_interval = 10
         recorder._session_context = threading.local()
 
         self.assertEqual(recorder.events, ["server 1"])
@@ -272,6 +681,13 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.root = SimpleNamespace(after=lambda _delay, callback: callback())
         recorder.status = SimpleNamespace(set=statuses.append)
         recorder._active_session_id = "session-1"
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession(
+                "session-1",
+                "Session 1",
+                {"status": recorder.status},
+            )
+        }
         recorder._session_context = threading.local()
         recorder._focus_target_if_due = Mock()
         recorder.release_stuck_inputs = Mock()
@@ -320,16 +736,109 @@ class MacroRecorderAutomationTests(unittest.TestCase):
     def test_recording_loop_wait_uses_configured_interval(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
         recorder.recording_loop_interval = 0.1
+        waits = []
+
+        class RecordingStop:
+            def is_set(self):
+                return False
+
+            def wait(self, duration):
+                waits.append(duration)
+                return False
+
+        recorder.background_stop = RecordingStop()
+        recorder.background_pause = threading.Event()
+        recorder.background_held_buttons = set()
+        recorder.background_held_keys = set()
+
+        recorder._wait_recording_loop_interval()
+
+        self.assertEqual(waits, [0.05, 0.05])
+
+    def test_rune_failure_does_not_leave_fishing_loop_paused(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
+        recorder.automation_timed_runes = False
+        recorder.automation_stop = threading.Event()
+        recorder.background_stop = threading.Event()
+        recorder.background_pause = threading.Event()
+        recorder.background_pause.set()
+        recorder.automation_running = True
+        recorder.profile = {}
+        recorder._focus_target_if_due = Mock()
+        recorder._read_mana_percent = Mock(return_value=100)
+        recorder.release_stuck_inputs = Mock()
+        recorder._rune_once = Mock(return_value=False)
+        statuses = []
+        recorder.status = SimpleNamespace(set=statuses.append)
+        session = macro_recorder.MacroSession(
+            "session-1",
+            "Session 1",
+            {
+                "automation_running": True,
+                "automation_stop": recorder.automation_stop,
+                "background_stop": recorder.background_stop,
+                "background_pause": recorder.background_pause,
+                "background_error": None,
+                "status": recorder.status,
+            },
+        )
+        recorder._sessions = {"session-1": session}
+        recorder.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        recorder._run_in_session = macro_recorder.MacroRecorder._run_in_session.__get__(
+            recorder, macro_recorder.MacroRecorder
+        )
+
+        recorder._automation_loop()
+
+        self.assertTrue(recorder.automation_stop.is_set())
+        self.assertFalse(recorder.background_stop.is_set())
+        self.assertFalse(recorder.background_pause.is_set())
+        self.assertIn("Rune automation stopped; fishing loop continues", statuses)
+
+    def test_background_recording_error_stops_cleanly_and_reports_it(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._active_session_id = "session-1"
+        recorder._session_context = threading.local()
+        recorder.background_stop = threading.Event()
         recorder.automation_stop = threading.Event()
         recorder.background_pause = threading.Event()
         recorder.background_held_buttons = set()
         recorder.background_held_keys = set()
-        pauses = []
+        recorder.events = [{"type": "move"}]
+        recorder._perform_event = Mock(side_effect=RuntimeError("test recording failure"))
+        statuses = []
+        recorder.status = SimpleNamespace(set=statuses.append)
+        recorder.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession(
+                "session-1",
+                "Session 1",
+                {
+                    "status": recorder.status,
+                    "automation_stop": recorder.automation_stop,
+                    "background_stop": recorder.background_stop,
+                    "background_pause": recorder.background_pause,
+                    "background_error": None,
+                },
+            )
+        }
+        recorder._run_in_session = macro_recorder.MacroRecorder._run_in_session.__get__(
+            recorder, macro_recorder.MacroRecorder
+        )
 
-        with patch("macro_recorder.time.sleep", side_effect=pauses.append):
-            recorder._wait_recording_loop_interval()
+        with patch.object(macro_recorder.messagebox, "showerror") as showerror:
+            recorder._background_loop()
 
-        self.assertEqual(pauses, [0.05, 0.05])
+        self.assertTrue(recorder.background_stop.is_set())
+        self.assertFalse(recorder.automation_stop.is_set())
+        self.assertIn("recorded event 1/1 (move)", recorder.background_error)
+        self.assertTrue(any("test recording failure" in status for status in statuses))
+        recorder._set_session_status("session-1", "Waiting: mana 20%")
+        self.assertEqual(statuses[-1], recorder.background_error)
+        showerror.assert_called_once()
+        self.assertIn("test recording failure", showerror.call_args.args[1])
 
     def test_mouse_wheel_scrolls_vertically_and_shift_wheel_horizontally(self):
         calls = []
@@ -346,18 +855,167 @@ class MacroRecorderAutomationTests(unittest.TestCase):
 
     def test_restart_launches_current_python_and_script(self):
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._build_restart_state = Mock(
+            return_value={
+                "version": 1,
+                "active_session_id": "session-2",
+                "sessions": [{"session_id": "session-2", "events": [{"type": "move"}]}],
+            }
+        )
         recorder.close = Mock()
 
         with patch.object(macro_recorder.messagebox, "askyesno", return_value=True):
             with patch.object(macro_recorder.subprocess, "Popen") as popen:
-                recorder.restart_program()
+                with patch.object(macro_recorder.sys, "argv", ["macro_recorder.py", "--flag", "--restore-state", "old.json"]):
+                    recorder.restart_program()
 
-        popen.assert_called_once_with(
-            [macro_recorder.sys.executable, *macro_recorder.sys.argv],
-            cwd=macro_recorder.Path.cwd(),
-            close_fds=True,
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[:3],
+            [macro_recorder.sys.executable, "macro_recorder.py", "--flag"],
+        )
+        self.assertEqual(command[3], "--restore-state")
+        snapshot_path = macro_recorder.Path(command[4])
+        try:
+            self.assertEqual(
+                json.loads(snapshot_path.read_text(encoding="utf-8")),
+                recorder._build_restart_state.return_value,
+            )
+        finally:
+            snapshot_path.unlink(missing_ok=True)
+        self.assertEqual(
+            popen.call_args.kwargs,
+            {"cwd": macro_recorder.Path.cwd(), "close_fds": True},
         )
         recorder.close.assert_called_once()
+
+    def test_restart_snapshot_captures_every_session_and_selected_window(self):
+        class FakeVariable:
+            def __init__(self, value=None):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {}
+        recorder._next_session_number = 1
+        recorder._active_session_id = "session-2"
+        recorder._session_context = threading.local()
+        recorder._default_profile = {"bp1": {"first_slot": None}}
+        recorder.background_targets = {"Target window": (123, 456)}
+        recorder.global_focus_interval_var = FakeVariable("12")
+        with patch.object(macro_recorder.tk, "StringVar", side_effect=FakeVariable), patch.object(
+            macro_recorder.tk, "BooleanVar", side_effect=FakeVariable
+        ):
+            first = recorder._new_session("Server 1", "session-1")
+            second = recorder._new_session("Server 2", "session-2")
+
+        first.state["events"] = [{"type": "key_down", "key": {"value": "a"}}]
+        first.state["profile"]["bp1"]["first_slot"] = (10, 20)
+        second.state["events"] = [{"type": "move", "x": 2, "y": 3}]
+        second.state["profile"]["bp1"]["first_slot"] = (30, 40)
+        second.state["background_target_var"].set("Target window")
+
+        snapshot = recorder._build_restart_state()
+
+        self.assertEqual(snapshot["active_session_id"], "session-2")
+        self.assertEqual(snapshot["global_focus_interval"], "12")
+        self.assertEqual(len(snapshot["sessions"]), 2)
+        self.assertEqual(snapshot["sessions"][0]["events"][0]["type"], "key_down")
+        self.assertEqual(snapshot["sessions"][0]["profile"]["bp1"]["first_slot"], (10, 20))
+        self.assertEqual(snapshot["sessions"][1]["settings"]["target"], [123, 456])
+
+    def test_restart_restore_preserves_sessions_recordings_profiles_and_windows(self):
+        class FakeVariable:
+            def __init__(self, value=None):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession("session-1", "Session 1")
+        }
+        recorder._active_session_id = "session-1"
+        recorder._next_session_number = 2
+        recorder._session_context = threading.local()
+        recorder._default_profile = {"bp1": {"first_slot": None}}
+        recorder.background_targets = {"Game — Server 2 (PID 222, window 333)": (222, 333)}
+        recorder.global_focus_interval_var = FakeVariable("15")
+        recorder.session_selector = Mock()
+        recorder._switch_session = Mock(
+            side_effect=lambda session_id, **_kwargs: setattr(
+                recorder, "_active_session_id", session_id
+            )
+        )
+        recorder._update_profile_status = Mock()
+        recorder._refresh_events = Mock()
+        snapshot = {
+            "version": 1,
+            "active_session_id": "session-2",
+            "global_focus_interval": "15",
+            "sessions": [
+                {
+                    "session_id": "session-1",
+                    "name": "Server 1",
+                    "events": [{"type": "key_down", "key": {"value": "a"}}],
+                    "profile": {"bp1": {"first_slot": [10, 20]}},
+                    "backpack_names": ["bp1"],
+                    "automation_backpack": 0,
+                    "automation_slot": 9,
+                    "settings": {"threshold": "72", "target": None},
+                },
+                {
+                    "session_id": "session-2",
+                    "name": "Server 2",
+                    "events": [{"type": "move", "x": 40, "y": 50}],
+                    "profile": {"bp1": {"first_slot": [30, 40]}},
+                    "backpack_names": ["bp1"],
+                    "automation_backpack": 0,
+                    "automation_slot": 12,
+                    "settings": {
+                        "threshold": "88",
+                        "target": [222, 333],
+                        "timed_runes": True,
+                        "rune_interval": "90",
+                    },
+                },
+            ],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as state_file:
+            json.dump(snapshot, state_file)
+            state_path = state_file.name
+
+        try:
+            with patch.object(macro_recorder.tk, "StringVar", side_effect=FakeVariable), patch.object(
+                macro_recorder.tk, "BooleanVar", side_effect=FakeVariable
+            ):
+                recorder.restore_restart_state(state_path)
+        finally:
+            self.assertFalse(macro_recorder.Path(state_path).exists())
+
+        self.assertEqual(recorder.active_session_id, "session-2")
+        self.assertEqual(recorder.global_focus_interval_var.get(), "15")
+        self.assertEqual(recorder._sessions["session-1"].name, "Server 1")
+        self.assertEqual(recorder._sessions["session-1"].state["events"][0]["type"], "key_down")
+        self.assertEqual(recorder._sessions["session-1"].state["automation_slot"], 9)
+        self.assertEqual(recorder._sessions["session-2"].state["profile"]["bp1"]["first_slot"], [30, 40])
+        self.assertEqual(recorder._sessions["session-2"].state["automation_slot"], 12)
+        self.assertEqual(recorder._sessions["session-2"].state["threshold_var"].get(), "88")
+        self.assertTrue(recorder._sessions["session-2"].state["timed_runes_var"].get())
+        self.assertEqual(recorder._sessions["session-2"].state["rune_interval_var"].get(), "90")
+        self.assertEqual(
+            recorder._sessions["session-2"].state["background_target_var"].get(),
+            "Game — Server 2 (PID 222, window 333)",
+        )
 
     def test_recording_batches_ui_refreshes_and_limits_visible_history(self):
         callbacks = []
@@ -370,6 +1028,13 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.event_refresh_pending = False
         recorder.last_event_time = None
         recorder._active_session_id = "session-1"
+        recorder._sessions = {
+            "session-1": macro_recorder.MacroSession(
+                "session-1",
+                "Session 1",
+                {"events": recorder.events},
+            )
+        }
         recorder._session_context = threading.local()
         recorder.root = SimpleNamespace(after=lambda delay, callback: callbacks.append((delay, callback)))
         recorder.events_view = SimpleNamespace(
@@ -398,6 +1063,8 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         }
         recorder._active_session_id = "session-1"
         recorder._session_context = threading.local()
+        recorder._coordinator_stop = threading.Event()
+        recorder._coordinator_thread = None
         recorder.recording = False
         recorder.playing = False
         recorder.automation_running = False
@@ -412,12 +1079,13 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         recorder.backpack_names = ["bp1", "bp2"]
         recorder.background_target_var = SimpleNamespace(get=lambda: "Foreground input")
         recorder.background_targets = {}
-        recorder.focus_interval_var = SimpleNamespace(get=lambda: "10")
+        recorder.global_focus_interval_var = SimpleNamespace(get=lambda: "10")
         recorder.recording_loop_interval_var = SimpleNamespace(get=lambda: "0")
         recorder.timed_runes_var = SimpleNamespace(get=lambda: False)
         recorder.automation_slot = 7
         recorder.automation_backpack = 1
         recorder.automation_stop = threading.Event()
+        recorder.background_stop = threading.Event()
         recorder.background_pause = threading.Event()
         recorder.background_enabled = SimpleNamespace(get=lambda: False)
         recorder.events = []
@@ -464,7 +1132,9 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             ],
         )
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
-        with patch.object(macro_recorder, "Quartz", fake_quartz):
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder, "AppKit", None
+        ):
             with patch.object(macro_recorder.subprocess, "run") as run:
                 recorder._focus_target_window(123, 456)
 
@@ -473,13 +1143,180 @@ class MacroRecorderAutomationTests(unittest.TestCase):
         self.assertIn('name is "Game \\"One\\""', script)
         self.assertIn('perform action "AXRaise"', script)
         self.assertIn('set value of attribute "AXMain" of targetWindow to true', script)
+        self.assertIn("set frontmost of targetProcess to true", script)
+
+    def test_focus_failure_suggests_refreshing_and_selecting_game_window(self):
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowOwnerPID="pid",
+            kCGWindowNumber="window_id",
+            kCGWindowName="name",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {"pid": 123, "window_id": 456, "name": "Game"}
+            ],
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder, "AppKit", None
+        ):
+            with patch.object(
+                macro_recorder.subprocess,
+                "run",
+                side_effect=macro_recorder.subprocess.CalledProcessError(
+                    1, ["osascript"], stderr="Target process did not become frontmost"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Confirm the selected window is the game.*Accessibility permission",
+                ):
+                    recorder._focus_target_window(123, 456)
+
+    def test_focus_uses_native_activation_and_verifies_frontmost_process(self):
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowOwnerPID="pid",
+            kCGWindowNumber="window_id",
+            kCGWindowName="name",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {"pid": 123, "window_id": 456, "name": "Game"}
+            ],
+        )
+        running_app = SimpleNamespace(
+            activateWithOptions_=Mock(return_value=True)
+        )
+        frontmost_app = SimpleNamespace(processIdentifier=lambda: 123)
+        fake_appkit = SimpleNamespace(
+            NSRunningApplication=SimpleNamespace(
+                runningApplicationWithProcessIdentifier_=Mock(return_value=running_app)
+            ),
+            NSApplicationActivateIgnoringOtherApps=1,
+            NSWorkspace=SimpleNamespace(
+                sharedWorkspace=lambda: SimpleNamespace(
+                    frontmostApplication=lambda: frontmost_app
+                )
+            ),
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder, "AppKit", fake_appkit
+        ):
+            with patch.object(macro_recorder.subprocess, "run") as run:
+                recorder._focus_target_window(123, 456)
+
+        running_app.activateWithOptions_.assert_called_once_with(1)
+        fake_appkit.NSRunningApplication.runningApplicationWithProcessIdentifier_.assert_called_once_with(123)
+        run.assert_called_once()
+
+    def test_focus_fails_if_native_activation_does_not_front_target_process(self):
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowOwnerPID="pid",
+            kCGWindowNumber="window_id",
+            kCGWindowName="name",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {"pid": 123, "window_id": 456, "name": "Game"}
+            ],
+        )
+        running_app = SimpleNamespace(activateWithOptions_=Mock(return_value=False))
+        fake_appkit = SimpleNamespace(
+            NSRunningApplication=SimpleNamespace(
+                runningApplicationWithProcessIdentifier_=Mock(return_value=running_app)
+            ),
+            NSApplicationActivateIgnoringOtherApps=1,
+            NSWorkspace=SimpleNamespace(
+                sharedWorkspace=lambda: SimpleNamespace(
+                    frontmostApplication=lambda: SimpleNamespace(processIdentifier=lambda: 999)
+                )
+            ),
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder, "AppKit", fake_appkit
+        ), patch.object(macro_recorder.subprocess, "run"):
+            with patch.object(macro_recorder.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "macOS did not activate window 456"):
+                    recorder._focus_target_window(123, 456)
+
+    def test_focus_target_with_empty_title_does_not_query_for_empty_name(self):
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowOwnerPID="pid",
+            kCGWindowNumber="window_id",
+            kCGWindowName="name",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {"pid": 123, "window_id": 456, "name": ""}
+            ],
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder, "AppKit", None
+        ):
+            with patch.object(macro_recorder.subprocess, "run") as run:
+                recorder._focus_target_window(123, 456)
+
+        script = run.call_args.args[0][2]
+        self.assertNotIn('whose name is ""', script)
+        self.assertIn("count of windows of targetProcess", script)
+        self.assertIn("set frontmost of targetProcess to true", script)
+
+    def test_refresh_background_targets_omits_windows_without_titles(self):
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowOwnerPID="pid",
+            kCGWindowNumber="window_id",
+            kCGWindowLayer="layer",
+            kCGWindowBounds="bounds",
+            kCGWindowOwnerName="owner",
+            kCGWindowName="name",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {
+                    "pid": 123,
+                    "window_id": 456,
+                    "layer": 0,
+                    "bounds": {"Width": 100, "Height": 100},
+                    "owner": "CursorUIViewService",
+                    "name": "Popover",
+                },
+                {
+                    "pid": 124,
+                    "window_id": 457,
+                    "layer": 0,
+                    "bounds": {"Width": 100, "Height": 100},
+                    "owner": "Game",
+                    "name": "Server",
+                },
+            ],
+        )
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.background_target_var = SimpleNamespace(get=lambda: "Foreground input", set=Mock())
+        recorder.background_target_menu = SimpleNamespace(configure=Mock())
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder.os, "getpid", return_value=99
+        ):
+            recorder._refresh_background_targets()
+
+        self.assertEqual(
+            recorder.background_targets,
+            {"Game — Server (PID 124, window 457)": (124, 457)},
+        )
 
     def test_focus_is_reused_until_configured_interval_expires(self):
         with tempfile.TemporaryFile(mode="w+") as focus_state:
             recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
             recorder.automation_target_pid = 123
             recorder.automation_target_window_id = 456
-            recorder.automation_focus_interval = 10
+            recorder._global_focus_interval = 10
             recorder.last_focus_time = 0
             recorder.focus_lock_file = focus_state
             recorder.focus_lock_held = False
@@ -501,7 +1338,7 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
             recorder.automation_target_pid = 123
             recorder.automation_target_window_id = 456
-            recorder.automation_focus_interval = 5
+            recorder._global_focus_interval = 5
             recorder.last_focus_time = 0
             recorder.automation_stop = threading.Event()
             recorder.focus_input_mutex = threading.RLock()
@@ -525,17 +1362,46 @@ class MacroRecorderAutomationTests(unittest.TestCase):
             height=80,
             getpixel=Mock(return_value=(10, 20, 30)),
         )
+        fake_quartz = SimpleNamespace(
+            kCGWindowListOptionAll=1,
+            kCGWindowListExcludeDesktopElements=2,
+            kCGNullWindowID=0,
+            kCGWindowNumber="window_id",
+            kCGWindowOwnerPID="pid",
+            kCGWindowBounds="bounds",
+            CGWindowListCopyWindowInfo=lambda *_args: [
+                {
+                    "window_id": 456,
+                    "pid": 123,
+                    "bounds": {"X": 100, "Y": 200, "Width": 50, "Height": 40},
+                }
+            ],
+        )
         recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
         recorder.automation_target_pid = 123
         recorder.automation_target_window_id = 456
         recorder._target_window_image = Mock(
             return_value=(image, {"X": 100, "Y": 200, "Width": 50, "Height": 40})
         )
-
-        color = recorder._sample_pixel((110, 210))
-
+        with patch.object(macro_recorder, "Quartz", fake_quartz), patch.object(
+            macro_recorder, "AppKit", None
+        ):
+            color = recorder._sample_pixel((110, 210))
         self.assertEqual(color, (10, 20, 30))
         image.getpixel.assert_called_once_with((20, 20))
+
+    def test_mana_color_matching_uses_configured_per_channel_tolerance(self):
+        recorder = macro_recorder.MacroRecorder.__new__(macro_recorder.MacroRecorder)
+        recorder.profile = {
+            "mana_point": (10, 20),
+            "mana_color": [100, 150, 200],
+            "mana_color_tolerance": 10,
+        }
+        recorder._sample_pixel = Mock(return_value=(110, 142, 205))
+
+        self.assertEqual(recorder._read_mana_percent(), 100.0)
+        recorder._sample_pixel.return_value = (111, 150, 200)
+        self.assertEqual(recorder._read_mana_percent(), 0.0)
 
 
 if __name__ == "__main__":

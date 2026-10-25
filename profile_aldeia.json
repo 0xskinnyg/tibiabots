@@ -1,13 +1,13 @@
 {
   "mana_threshold_percent": 80.0,
   "mana_point": [
-    1390,
-    179
+    1406,
+    183
   ],
   "mana_color": [
-    128,
-    125,
-    255
+    53,
+    51,
+    95
   ],
   "mana_color_tolerance": 35,
   "slot_width": 34,
@@ -15,19 +15,19 @@
   "start_slot": 1,
   "bp1": {
     "first_slot": [
-      1101,
-      98
+      1146,
+      99
     ],
-    "rows": 4,
-    "columns": 5
+    "rows": 5,
+    "columns": 4
   },
   "bp2": {
     "first_slot": [
-      1099,
-      259
+      1143,
+      307
     ],
-    "rows": 4,
-    "columns": 5
+    "rows": 5,
+    "columns": 4
   },
   "left_hand": [
     1303,
