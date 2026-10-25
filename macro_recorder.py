@@ -810,20 +810,10 @@ class MacroRecorder:
             self._schedule_in_session(session_id, self.calibrate_mana_color)
             return
         if key == Key.f6:
-            self._schedule_in_session(
-                session_id,
-                self.calibrate_point,
-                "bp1",
-                delay_seconds=1.5,
-            )
+            self.root.after(0, lambda: self.calibrate_point("bp1"))
             return
         if key == Key.f7:
-            self._schedule_in_session(
-                session_id,
-                self.calibrate_point,
-                "bp2",
-                delay_seconds=1.5,
-            )
+            self.root.after(0, lambda: self.calibrate_point("bp2"))
             return
         if key == Key.f8:
             self._schedule_in_session(session_id, self.toggle_recording)
@@ -1064,17 +1054,7 @@ class MacroRecorder:
             raise ValueError("Mana threshold must be between 0 and 100")
         self.profile["mana_threshold_percent"] = threshold
 
-    def calibrate_point(self, target: str, delay_seconds: float = 0.0) -> None:
-        if delay_seconds > 0:
-            self.status.set(f"Move the cursor to {target.upper()} first slot… capturing in {delay_seconds:.1f}s")
-            session_id = getattr(self._session_context, "session_id", self._active_session_id)
-            self._schedule_in_session(
-                session_id,
-                self._capture_point,
-                target,
-                delay_ms=int(delay_seconds * 1000),
-            )
-            return
+    def calibrate_point(self, target: str) -> None:
         self.status.set(f"Capturing {target.replace('_', ' ')} from the current cursor position")
         self._capture_point(target)
 
@@ -1097,7 +1077,7 @@ class MacroRecorder:
             ttk.Button(
                 self.backpack_calibration_frame,
                 text=f"Set {name.upper()} first slot",
-                command=lambda backpack=name: self.calibrate_point(backpack, delay_seconds=1.5),
+                command=lambda backpack=name: self.calibrate_point(backpack),
             ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=2)
 
     def add_backpack(self) -> None:
