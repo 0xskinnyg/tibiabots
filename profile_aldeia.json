@@ -1,13 +1,13 @@
 {
   "mana_threshold_percent": 80.0,
   "mana_point": [
-    1406,
-    183
+    459,
+    206
   ],
   "mana_color": [
-    53,
-    51,
-    95
+    116,
+    113,
+    220
   ],
   "mana_color_tolerance": 35,
   "slot_width": 34,
@@ -16,22 +16,22 @@
   "bp1": {
     "first_slot": [
       1146,
-      99
+      102
     ],
     "rows": 5,
     "columns": 4
   },
   "bp2": {
     "first_slot": [
-      1143,
-      307
+      1147,
+      309
     ],
     "rows": 5,
     "columns": 4
   },
   "left_hand": [
-    1303,
-    317
+    1324,
+    324
   ],
   "fish_slot": [
     1294,

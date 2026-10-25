@@ -174,6 +174,7 @@ class MacroRecorder:
         self.focus_lock_file = Path(tempfile.gettempdir(), "macro_recorder_focus.lock").open("a+")
         self.background_targets: dict[str, tuple[int, int]] = {}
         self.backpack_names = ["bp1", "bp2"]
+        self.backpack_grid_vars: dict[str, tuple[tk.StringVar, tk.StringVar]] = {}
         self.profile: dict[str, Any] = {
             "mana_threshold_percent": 80,
             "mana_point": None,
@@ -1197,8 +1198,21 @@ class MacroRecorder:
             return Key[data["value"]]
         return KeyCode(char=data["value"])
 
+    def _any_automation_active(self) -> bool:
+        """Return whether any session is running rune or background automation."""
+        return any(
+            bool(
+                session.state.get("automation_running")
+                or session.state.get("background_running")
+            )
+            for session in self._sessions.values()
+        )
+
     def toggle_recording(self) -> None:
         if self.playing:
+            return
+        if not self.recording and self._any_automation_active():
+            self.status.set("Recording blocked while rune automation is running")
             return
         if self.recording:
             self.recording = False
@@ -1217,7 +1231,14 @@ class MacroRecorder:
                 self.record_button.configure(text="■  Stop (F8)")
 
     def start_playback(self) -> None:
-        if self.recording or self.playing or self.automation_running or not self.events:
+        if (
+            self.recording
+            or self.playing
+            or self._any_automation_active()
+            or not self.events
+        ):
+            if self._any_automation_active():
+                self.status.set("Replay blocked while rune automation is running")
             return
         self.playing = True
         self.stop_playback.clear()
@@ -1386,14 +1407,30 @@ class MacroRecorder:
             data = json.loads(Path(filename).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("profile must be a JSON object")
-            self.profile.update(data)
+            # Replace the backpack collection from the file rather than merging it;
+            # otherwise removed backpacks from an older profile would silently return.
+            for existing_name in [key for key in self.profile if re.fullmatch(r"bp\d+", key)]:
+                self.profile.pop(existing_name, None)
+            for key, value in data.items():
+                if not re.fullmatch(r"bp\d+", key):
+                    self.profile[key] = value
             discovered = sorted(
-                (key for key in self.profile if re.fullmatch(r"bp\d+", key)),
+                (key for key in data if re.fullmatch(r"bp\d+", key)),
                 key=lambda key: int(key[2:]),
             )
-            self.backpack_names = discovered or ["bp1", "bp2"]
-            for name in ("bp1", "bp2"):
-                self.profile.setdefault(name, {"first_slot": None, "rows": 5, "columns": 4})
+            if not discovered:
+                discovered = ["bp1"]
+                self.profile["bp1"] = {"first_slot": None, "rows": 4, "columns": 5}
+            self.backpack_names = discovered
+            for name in self.backpack_names:
+                backpack = self.profile.get(name)
+                if not isinstance(backpack, dict):
+                    raise ValueError(f"{name} must be a JSON object")
+                backpack.setdefault("first_slot", None)
+                backpack.setdefault("rows", 4)
+                backpack.setdefault("columns", 5)
+            self.automation_backpack = 0
+            self.automation_slot = int(self.profile.get("start_slot", 1))
             self._rebuild_backpack_buttons()
             self.threshold_var.set(str(self.profile.get("mana_threshold_percent", 80)))
             self.slot_size_var.set(f"{self.profile.get('slot_width', 34)} x {self.profile.get('slot_height', 34)}")
@@ -1412,6 +1449,24 @@ class MacroRecorder:
         if not 0 <= threshold <= 100:
             raise ValueError("Mana threshold must be between 0 and 100")
         self.profile["mana_threshold_percent"] = threshold
+        # Persist the UI's per-backpack geometry into the JSON profile before
+        # saving or starting automation. Rune traversal reads these values only.
+        for name, (rows_var, columns_var) in self.backpack_grid_vars.items():
+            if name not in self.backpack_names or name not in self.profile:
+                continue
+            try:
+                rows = int(rows_var.get())
+                columns = int(columns_var.get())
+            except ValueError as error:
+                raise ValueError(f"{name.upper()} rows and columns must be whole numbers") from error
+            if not 1 <= rows <= 20:
+                raise ValueError(f"{name.upper()} rows must be between 1 and 20")
+            if not 1 <= columns <= 20:
+                raise ValueError(f"{name.upper()} columns must be between 1 and 20")
+            if rows * columns < 2:
+                raise ValueError(f"{name.upper()} must have at least 2 slots (rows × columns >= 2)")
+            self.profile[name]["rows"] = rows
+            self.profile[name]["columns"] = columns
 
     def calibrate_point(self, target: str) -> None:
         # Allow the user time to move the cursor onto the desired pixel/slot
@@ -1435,21 +1490,90 @@ class MacroRecorder:
             return
         for child in self.backpack_calibration_frame.winfo_children():
             child.destroy()
+        self.backpack_grid_vars = {}
         for index, name in enumerate(self.backpack_names):
+            backpack = self.profile.setdefault(
+                name, {"first_slot": None, "rows": 4, "columns": 5}
+            )
+            backpack.setdefault("rows", 4)
+            backpack.setdefault("columns", 5)
+            rows_var = tk.StringVar(value=str(backpack["rows"]))
+            columns_var = tk.StringVar(value=str(backpack["columns"]))
+            self.backpack_grid_vars[name] = (rows_var, columns_var)
+            row = index
             ttk.Button(
                 self.backpack_calibration_frame,
                 text=f"Set {name.upper()} first slot",
-                command=lambda backpack=name: self.calibrate_point(backpack),
-            ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=2)
+                command=lambda backpack_name=name: self.calibrate_point(backpack_name),
+            ).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(self.backpack_calibration_frame, text="Rows:").grid(
+                row=row, column=1, sticky="e", padx=(4, 2), pady=2
+            )
+            ttk.Entry(self.backpack_calibration_frame, width=4, textvariable=rows_var).grid(
+                row=row, column=2, sticky="w", padx=(0, 8), pady=2
+            )
+            ttk.Label(self.backpack_calibration_frame, text="Columns:").grid(
+                row=row, column=3, sticky="e", padx=(4, 2), pady=2
+            )
+            ttk.Entry(self.backpack_calibration_frame, width=4, textvariable=columns_var).grid(
+                row=row, column=4, sticky="w", padx=(0, 8), pady=2
+            )
+            ttk.Button(
+                self.backpack_calibration_frame,
+                text="Remove",
+                command=lambda backpack_name=name: self.remove_backpack(backpack_name),
+                state="disabled" if len(self.backpack_names) == 1 else "normal",
+            ).grid(row=row, column=5, sticky="w", padx=(2, 0), pady=2)
 
     def add_backpack(self) -> None:
-        next_number = len(self.backpack_names) + 1
+        try:
+            self._read_profile_fields()
+        except ValueError as error:
+            messagebox.showerror("Backpack settings", str(error))
+            return
+        used_numbers = {
+            int(name[2:]) for name in self.backpack_names
+            if re.fullmatch(r"bp\d+", name)
+        }
+        next_number = 1
+        while next_number in used_numbers:
+            next_number += 1
         name = f"bp{next_number}"
-        self.profile[name] = {"first_slot": None, "rows": 5, "columns": 4}
+        self.profile[name] = {"first_slot": None, "rows": 4, "columns": 5}
         self.backpack_names.append(name)
         self._rebuild_backpack_buttons()
         self._update_profile_status()
-        self.status.set(f"Added {name.upper()}; calibrate its first slot")
+        self.status.set(f"Added {name.upper()}; configure rows/columns and calibrate its first slot")
+
+    def remove_backpack(self, name: str) -> None:
+        if name not in self.backpack_names:
+            return
+        if len(self.backpack_names) <= 1:
+            messagebox.showinfo(
+                "Remove backpack",
+                "At least one backpack must remain for rune-making. You can remove all the others.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Remove backpack",
+            f"Remove {name.upper()} from this session's rune-making rotation?",
+        ):
+            return
+        try:
+            self._read_profile_fields()
+        except ValueError as error:
+            messagebox.showerror("Backpack settings", str(error))
+            return
+        old_index = self.backpack_names.index(name)
+        self.backpack_names.remove(name)
+        self.profile.pop(name, None)
+        if self.automation_backpack > old_index:
+            self.automation_backpack -= 1
+        self.automation_backpack = min(self.automation_backpack, len(self.backpack_names) - 1)
+        self.automation_slot = max(1, int(self.profile.get("start_slot", 1)))
+        self._rebuild_backpack_buttons()
+        self._update_profile_status()
+        self.status.set(f"Removed {name.upper()} from rune-making rotation")
 
     def calibrate_mana_color(self) -> None:
         self.status.set("Capturing the exact filled-mana pixel under the cursor")
@@ -1720,7 +1844,10 @@ class MacroRecorder:
                     if remaining <= 0:
                         break
                     self._wait_recorded_event_delay(min(remaining, 0.05))
-                self._check_session_rune()
+                # Do not check/cast runes mid-pass. A rune drag changes the global
+                # cursor and can turn the next recorded click into an item drop.
+                # Rune readiness is checked before the pass, so the whole recorded
+                # pass completes first and rune-making runs only between passes.
                 if self.background_stop.is_set() or self._coordinator_stop.is_set():
                     return
                 try:
@@ -1788,7 +1915,6 @@ class MacroRecorder:
         while remaining > 0:
             if self.background_stop.is_set() or self._coordinator_stop.is_set():
                 return
-            self._check_session_rune()
             pause = min(remaining, 0.05)
             started = time.monotonic()
             if self._coordinator_stop.wait(pause):
@@ -2034,11 +2160,19 @@ class MacroRecorder:
 
     def _perform_event(self, recorded_event: dict[str, Any]) -> None:
         kind = recorded_event["type"]
+
+        # Mouse-move events are the most frequent events in a recording. They
+        # only reposition the global cursor; taking/releasing the cross-session
+        # focus lock for every move adds substantial overhead and can make
+        # repeated background playback feel increasingly sticky. Focus the
+        # target for actual input events (click, scroll, key), not cursor moves.
+        if kind == "move":
+            self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
+            return
+
         self._begin_focused_input()
         try:
-            if kind == "move":
-                self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
-            elif kind == "click":
+            if kind == "click":
                 self.mouse_controller.position = (recorded_event["x"], recorded_event["y"])
                 button = Button[recorded_event["button"]]
                 action = self.mouse_controller.press if recorded_event["pressed"] else self.mouse_controller.release
@@ -2111,18 +2245,29 @@ class MacroRecorder:
         return 100.0 if matches else 0.0
 
     def reset_automation_position(self) -> None:
-        """Restart rune-slot traversal at BP1's first usable slot."""
+        """Restart rune-slot traversal at the first configured backpack's first usable slot."""
+        if not self.backpack_names:
+            self.status.set("Add a backpack before starting rune-making")
+            return
         self.automation_backpack = 0
         self.automation_slot = int(self.profile.get("start_slot", 1))
-        self.status.set("Automation position reset to BP1 first slot")
+        self.status.set(f"Automation position reset to {self.backpack_names[0].upper()} first slot")
 
     def _rune_once(self) -> bool:
         # Ctrl can be held by the fishing/eating recording. Release it before
         # the drag so the client moves the rune instead of opening item look.
         self.release_stuck_inputs()
+        if not self.backpack_names:
+            raise RuntimeError("No backpacks configured for rune-making")
+        # Guard against a backpack being removed while automation is idle.
+        self.automation_backpack %= len(self.backpack_names)
         backpack_name = self.backpack_names[self.automation_backpack]
         backpack = self.profile[backpack_name]
-        max_slots = int(backpack.get("rows", 4)) * int(backpack.get("columns", 5))
+        rows = int(backpack.get("rows", 4))
+        columns = int(backpack.get("columns", 5))
+        if rows < 1 or columns < 1:
+            raise RuntimeError(f"{backpack_name.upper()} rows and columns must both be positive")
+        max_slots = rows * columns
 
         # Slot 0 is the backpack/container position; start at slot 1 and
         # advance through every remaining position without revisiting slots.
@@ -2131,9 +2276,16 @@ class MacroRecorder:
             self.automation_slot = int(self.profile.get("start_slot", 1))
             backpack_name = self.backpack_names[self.automation_backpack]
             backpack = self.profile[backpack_name]
-
+            columns = int(backpack.get("columns", 5))
+            rows = int(backpack.get("rows", 4))
+            max_slots = rows * columns
+            if rows < 1 or columns < 1 or max_slots < 2:
+                raise RuntimeError(
+                    f"{backpack_name.upper()} must have at least 2 slots (rows × columns >= 2)"
+                )
+            if self.automation_slot >= max_slots:
+                self.automation_slot = 1
         first_x, first_y = backpack["first_slot"]
-        columns = int(backpack.get("columns", 5))
         slot_x = int(round(first_x + (self.automation_slot % columns) * int(self.profile.get("slot_width", 34))))
         slot_y = int(round(first_y + (self.automation_slot // columns) * int(self.profile.get("slot_height", 34))))
         hand_x, hand_y = [int(round(value)) for value in self.profile["left_hand"]]
