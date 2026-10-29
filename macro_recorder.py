@@ -127,7 +127,15 @@ class MacroRecorder:
         self._sessions[self._active_session_id] = MacroSession(self._active_session_id, "Session 1")
         self._coordinator_stop = threading.Event()
         self._coordinator_thread: threading.Thread | None = None
-        self._global_focus_interval = 10.0
+        self._error_log_path = Path.home() / "macro_recorder_errors.json"
+        self._error_log_lock = threading.Lock()
+        self._error_records: list[dict[str, Any]] = []
+        try:
+            existing_logs = json.loads(self._error_log_path.read_text(encoding="utf-8"))
+            if isinstance(existing_logs, list):
+                self._error_records = [item for item in existing_logs if isinstance(item, dict)][-500:]
+        except (OSError, json.JSONDecodeError):
+            self._error_records = []
 
         self.root = root
         self.root.title("Macro Recorder")
@@ -196,8 +204,10 @@ class MacroRecorder:
         self.profile_status = tk.StringVar(value="Profile not calibrated")
         self.background_enabled = tk.BooleanVar(value=False)
         self.background_target_var = tk.StringVar(value="Foreground input")
-        self.global_focus_interval_var = tk.StringVar(value="10")
         self.recording_loop_interval_var = tk.StringVar(value="0")
+        self.session_switch_delay_var = tk.StringVar(value="10")
+        # Cache UI settings on the main thread; the coordinator must not call Tkinter from a worker.
+        self.session_switch_delay_seconds = 10.0
         self.timed_runes_var = tk.BooleanVar(value=False)
         self.rune_interval_var = tk.StringVar(value="60")
         self.recording_loop_interval = 0.0
@@ -277,14 +287,6 @@ class MacroRecorder:
         ttk.Button(session_row, text="Remove session", command=self.remove_active_session).pack(
             side="left", padx=(8, 0)
         )
-
-        focus_row = ttk.Frame(frame)
-        focus_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(focus_row, text="Global refocus interval for all sessions (sec):").pack(side="left")
-        self.focus_interval_entry = ttk.Entry(
-            focus_row, width=7, textvariable=self.global_focus_interval_var
-        )
-        self.focus_interval_entry.pack(side="left", padx=(6, 0))
 
         controls = ttk.Frame(frame)
         controls.pack(fill="x")
@@ -369,6 +371,11 @@ class MacroRecorder:
         )
         self.background_target_menu.pack(side="left", padx=(6, 6))
         ttk.Button(target_row, text="Refresh windows", command=self._refresh_background_targets).pack(side="left")
+        ttk.Label(target_row, text="Delay between sessions (sec):").pack(side="left", padx=(12, 4))
+        self.session_switch_delay_entry = ttk.Entry(
+            target_row, width=5, textvariable=self.session_switch_delay_var
+        )
+        self.session_switch_delay_entry.pack(side="left")
         ttk.Label(
             automation,
             text="Selected window receives normal foreground mouse and keyboard input.",
@@ -402,6 +409,61 @@ class MacroRecorder:
             text="Start over from BP1 first slot",
             command=self.reset_automation_position,
         ).grid(row=7, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        logs_frame = ttk.LabelFrame(frame, text="Error logs", padding=8)
+        logs_frame.pack(fill="both", expand=False, pady=(14, 0))
+        logs_header = ttk.Frame(logs_frame)
+        logs_header.pack(fill="x")
+        ttk.Label(logs_header, text=f"JSON log: {self._error_log_path}").pack(side="left", anchor="w")
+        ttk.Button(logs_header, text="Refresh", command=self._refresh_error_logs).pack(side="right")
+        self.logs_view = tk.Listbox(logs_frame, height=7, activestyle="none")
+        self.logs_view.pack(fill="both", expand=True, pady=(6, 0))
+        self._refresh_error_logs()
+
+    def _show_error(self, title: str, message: Any) -> None:
+        """Record errors without interrupting automation with modal dialogs."""
+        self._log_error(str(title), str(message))
+
+    def _log_error(self, title: str, message: str) -> None:
+        session_id = getattr(self._session_context, "session_id", self._active_session_id)
+        session = self._sessions.get(session_id)
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "session_id": session_id,
+            "session_name": session.name if session else None,
+            "title": title,
+            "message": message,
+        }
+        with self._error_log_lock:
+            self._error_records.append(record)
+            self._error_records = self._error_records[-500:]
+            try:
+                self._error_log_path.write_text(
+                    json.dumps(self._error_records, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError:
+                # Still surface the error in the UI if the log file cannot be written.
+                pass
+        try:
+            self.root.after(0, self._refresh_error_logs)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _refresh_error_logs(self) -> None:
+        if not hasattr(self, "logs_view"):
+            return
+        with self._error_log_lock:
+            records = list(self._error_records[-100:])
+        self.logs_view.delete(0, tk.END)
+        for record in records:
+            stamp = record.get("timestamp", "")
+            session = record.get("session_name") or record.get("session_id", "")
+            title = record.get("title", "Error")
+            message = str(record.get("message", "")).replace("\n", " ")
+            self.logs_view.insert(tk.END, f"{stamp} | {session} | {title}: {message}")
+        if records:
+            self.logs_view.yview_moveto(1.0)
 
     @property
     def active_session_id(self) -> str:
@@ -654,7 +716,7 @@ class MacroRecorder:
         except (OSError, TypeError, ValueError) as error:
             if snapshot_path is not None:
                 snapshot_path.unlink(missing_ok=True)
-            messagebox.showerror("Restart failed", str(error))
+            self._show_error("Restart failed", str(error))
             return
         self.close()
 
@@ -704,7 +766,6 @@ class MacroRecorder:
         return {
             "version": 1,
             "active_session_id": self._active_session_id,
-            "global_focus_interval": self.global_focus_interval_var.get(),
             "sessions": sessions,
         }
 
@@ -778,9 +839,6 @@ class MacroRecorder:
             if active_session_id not in self._sessions:
                 raise ValueError("restart snapshot refers to an unknown active session")
             self._switch_session(active_session_id, force=True)
-            self.global_focus_interval_var.set(
-                str(snapshot.get("global_focus_interval", "10"))
-            )
             self._update_profile_status()
             self._refresh_events()
         finally:
@@ -795,7 +853,7 @@ class MacroRecorder:
                 Quartz.kCGNullWindowID,
             )
         except Exception as error:
-            messagebox.showerror("Background target", f"Could not list windows: {error}")
+            self._show_error("Background target", f"Could not list windows: {error}")
             return
 
         targets: dict[str, tuple[int, int]] = {}
@@ -847,19 +905,29 @@ class MacroRecorder:
 
         title = str(window.get(Quartz.kCGWindowName) or "").strip()
         escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
-        running_app = None
-        activation_succeeded = False
         if AppKit is not None:
             running_app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
             if running_app is None:
                 raise RuntimeError(
                     f"The selected window's process (PID {pid}) is no longer running; refresh windows."
                 )
-            activation_succeeded = bool(
-                running_app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
-            )
+            # First ask AppKit to activate the owning application. Then ask
+            # System Events to raise the exact Accessibility window. These are
+            # deliberately sequential (not competing activation attempts):
+            # setting a window's AX index alone may not make its app frontmost.
+            try:
+                activate_option = getattr(
+                    AppKit, "NSApplicationActivateIgnoringOtherApps", 1 << 1
+                )
+                running_app.activateWithOptions_(activate_option)
+            except Exception:
+                # System Events below is a second route if AppKit activation is
+                # unavailable or rejected by this macOS/PyObjC version.
+                pass
+            time.sleep(0.15)
+
         script_lines = [
-            'tell application "System Events"\n'
+            'tell application "System Events"',
             f"set targetProcess to first application process whose unix id is {pid}",
             "set frontmost of targetProcess to true",
         ]
@@ -887,11 +955,7 @@ class MacroRecorder:
                     "end if",
                 ]
             )
-        script_lines.extend(
-            [
-                "end tell",
-            ]
-        )
+        script_lines.append("end tell")
         script = "\n".join(script_lines)
         script_error: str | None = None
         try:
@@ -900,7 +964,7 @@ class MacroRecorder:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=8,
             )
         except (OSError, subprocess.SubprocessError) as error:
             script_error = getattr(error, "stderr", None) or str(error)
@@ -912,27 +976,31 @@ class MacroRecorder:
                     f"window is the game (not a system/helper window), refresh the window list, "
                     f"and verify Accessibility permission for System Events/osascript. {script_error}"
                 )
-            time.sleep(0.2)
+            time.sleep(0.25)
             return
 
         workspace = AppKit.NSWorkspace.sharedWorkspace()
-        for _ in range(10):
+        # Some games take a moment to become active. Retry activation and
+        # verification rather than aborting the entire session on the first
+        # delayed frontmost-app update.
+        activate_option = getattr(AppKit, "NSApplicationActivateIgnoringOtherApps", 1 << 1)
+        for attempt in range(12):
             frontmost = workspace.frontmostApplication()
             if frontmost is not None and int(frontmost.processIdentifier()) == pid:
-                time.sleep(0.2)
                 return
-            time.sleep(0.1)
-        activation_detail = (
-            "Native macOS activation API reported success."
-            if activation_succeeded
-            else "Native macOS activation API did not confirm success."
-        )
-        script_detail = f" Accessibility activation detail: {script_error}" if script_error else ""
+            if attempt in (3, 7):
+                try:
+                    running_app.activateWithOptions_(activate_option)
+                except Exception:
+                    pass
+            time.sleep(0.25)
+
+        script_detail = f" System Events detail: {script_error}" if script_error else ""
         raise RuntimeError(
-            f"macOS did not activate window {window_id} owned by PID {pid}. "
-            f"Confirm it is a normal game window, refresh the window list, and check "
-            f"Accessibility permissions for Python and System Events. "
-            f"{activation_detail}{script_detail}"
+            f"macOS still reports another application as frontmost after trying AppKit activation "
+            f"and raising window {window_id} owned by PID {pid}. Check Accessibility permissions "
+            f"for this Python app and System Events; ensure the selected window is a normal, visible "
+            f"game window and refresh the window list.{script_detail}"
         )
 
     def _acquire_focus_file_lock(self) -> None:
@@ -958,12 +1026,14 @@ class MacroRecorder:
         target = [self.automation_target_pid, self.automation_target_window_id]
         now = time.monotonic()
         last_focused = float(state.get("focused_at", 0.0))
-        if force or state.get("target") != target or now - last_focused >= self._global_focus_interval:
+        if force or state.get("target") != target:
             self._focus_target_window(*target)
             state = {
                 "target": target,
                 "focused_at": now,
-                "lease_until": now + self._global_focus_interval,
+                # The coordinator explicitly refocuses at the start of every
+                # session turn; this lease only prevents per-event refocusing.
+                "lease_until": now + 3600.0,
             }
             self.focus_lock_file.seek(0)
             self.focus_lock_file.truncate()
@@ -971,7 +1041,7 @@ class MacroRecorder:
             self.focus_lock_file.flush()
             self.last_focus_time = now
 
-    def _begin_focused_input(self) -> None:
+    def _begin_focused_input(self, force_focus: bool = False) -> None:
         owner = threading.get_ident()
         if self.focus_input_owner == owner:
             return
@@ -1005,11 +1075,7 @@ class MacroRecorder:
                     self.focus_input_mutex.release()
                     self.automation_stop.wait(remaining)
                     continue
-                should_refocus = (
-                    state.get("target") != target
-                    or lease_until <= now
-                    or now - self.last_focus_time >= self._global_focus_interval
-                )
+                should_refocus = force_focus or state.get("target") != target or lease_until <= now
                 self._ensure_target_focused(force=should_refocus)
                 return
             except Exception:
@@ -1025,10 +1091,9 @@ class MacroRecorder:
             self.focus_input_mutex.release()
 
     def _focus_target_if_due(self) -> None:
-        if (
-            self.automation_target_pid is None
-            or time.monotonic() - self.last_focus_time < self._global_focus_interval
-        ):
+        # Kept for the legacy single-session loops. Multi-session automation
+        # force-focuses once at the start of each coordinator turn.
+        if self.automation_target_pid is None or self.automation_target_window_id is None:
             return
         self._begin_focused_input()
         self._release_focused_input()
@@ -1378,13 +1443,13 @@ class MacroRecorder:
             self._refresh_events()
             self.status.set(f"Loaded recording: {Path(filename).name}")
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as error:
-            messagebox.showerror("Load recording", str(error))
+            self._show_error("Load recording", str(error))
 
     def save_profile(self) -> None:
         try:
             self._read_profile_fields()
         except ValueError as error:
-            messagebox.showerror("Save profile", str(error))
+            self._show_error("Save profile", str(error))
             return
         filename = filedialog.asksaveasfilename(
             title="Save automation profile",
@@ -1439,7 +1504,7 @@ class MacroRecorder:
             self._update_profile_status()
             self.status.set(f"Loaded profile: {Path(filename).name}")
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as error:
-            messagebox.showerror("Load profile", str(error))
+            self._show_error("Load profile", str(error))
 
     def _read_profile_fields(self) -> None:
         try:
@@ -1529,7 +1594,7 @@ class MacroRecorder:
         try:
             self._read_profile_fields()
         except ValueError as error:
-            messagebox.showerror("Backpack settings", str(error))
+            self._show_error("Backpack settings", str(error))
             return
         used_numbers = {
             int(name[2:]) for name in self.backpack_names
@@ -1562,7 +1627,7 @@ class MacroRecorder:
         try:
             self._read_profile_fields()
         except ValueError as error:
-            messagebox.showerror("Backpack settings", str(error))
+            self._show_error("Backpack settings", str(error))
             return
         old_index = self.backpack_names.index(name)
         self.backpack_names.remove(name)
@@ -1581,7 +1646,7 @@ class MacroRecorder:
 
     def _capture_mana_color(self) -> None:
         if ImageGrab is None and (self._selected_background_target() is None or Image is None):
-            messagebox.showerror("Mana color", "Install Pillow first: pip install Pillow")
+            self._show_error("Mana color", "Install Pillow first: pip install Pillow")
             return
         point = tuple(int(round(value)) for value in self.mouse_controller.position)
         target = (
@@ -1593,7 +1658,7 @@ class MacroRecorder:
         if used_calibrated_point:
             mana_point = self.profile.get("mana_point")
             if mana_point is None:
-                messagebox.showerror(
+                self._show_error(
                     "Mana color",
                     "The selected game window is not frontmost. Set the mana check point first, "
                     "or bring the game window forward and place the cursor over the filled mana pixel.",
@@ -1603,7 +1668,7 @@ class MacroRecorder:
         try:
             color = self._sample_pixel(point)
         except Exception as error:
-            messagebox.showerror(
+            self._show_error(
                 "Mana color",
                 "Could not capture the selected pixel. Check Screen Recording permission, "
                 "then retry.\n\n"
@@ -1651,6 +1716,17 @@ class MacroRecorder:
         for session_id in sessions_to_start:
             if not self._run_in_session(session_id, self._prepare_automation):
                 return
+        # Tkinter StringVar.get() must run on the UI thread. Cache the value here
+        # so the coordinator never blocks waiting for a UI event/click.
+        try:
+            switch_delay = float(self.session_switch_delay_var.get())
+        except (TypeError, ValueError):
+            self._show_error("Session switching", "Delay between sessions must be a number.")
+            return
+        if not 0 <= switch_delay <= 3600:
+            self._show_error("Session switching", "Delay between sessions must be between 0 and 3600 seconds.")
+            return
+        self.session_switch_delay_seconds = switch_delay
         for session_id in sessions_to_start:
             self._run_in_session(session_id, self._launch_automation)
         coordinator_stop = getattr(self, "_coordinator_stop", None)
@@ -1675,20 +1751,17 @@ class MacroRecorder:
         timed_runes = self.timed_runes_var.get()
         target = self._selected_background_target()
         if not timed_runes and target is None and ImageGrab is None:
-            messagebox.showerror("Rune automation", "Install Pillow first: pip install Pillow")
+            self._show_error("Rune automation", "Install Pillow first: pip install Pillow")
             return False
         if target is not None and (Quartz is None or (not timed_runes and Image is None)):
-            messagebox.showerror("Rune automation", "Window targeting requires macOS Quartz and Pillow")
+            self._show_error("Rune automation", "Window targeting requires macOS Quartz and Pillow")
             return False
         try:
             self._read_profile_fields()
-            focus_interval = float(self.global_focus_interval_var.get())
-            if not 1 <= focus_interval <= 3600:
-                raise ValueError("Global refocus interval must be between 1 and 3600 seconds")
             loop_interval = self._read_recording_loop_interval()
             rune_interval = self._read_rune_interval() if timed_runes else 0.0
         except ValueError as error:
-            messagebox.showerror("Rune automation", str(error))
+            self._show_error("Rune automation", str(error))
             return False
         required = [self.profile[name].get("first_slot") for name in self.backpack_names]
         required.append(self.profile.get("left_hand"))
@@ -1701,7 +1774,6 @@ class MacroRecorder:
             messagebox.showwarning("Rune automation", f"Calibrate {calibration} first.")
             return False
         self.automation_target_pid, self.automation_target_window_id = target or (None, None)
-        self._global_focus_interval = focus_interval
         self.recording_loop_interval = loop_interval
         self.automation_timed_runes = timed_runes
         self.rune_interval = rune_interval
@@ -1746,7 +1818,7 @@ class MacroRecorder:
 
     def test_mana_point(self) -> None:
         if ImageGrab is None and (self._selected_background_target() is None or Image is None):
-            messagebox.showerror("Mana test", "Install Pillow first: pip install Pillow")
+            self._show_error("Mana test", "Install Pillow first: pip install Pillow")
             return
         if not self.profile.get("mana_point") or not self.profile.get("mana_color"):
             messagebox.showwarning("Mana test", "Set the mana check point and capture the mana color first.")
@@ -1755,7 +1827,7 @@ class MacroRecorder:
             value = self._read_mana_percent()
             self.status.set(f"Mana point test: {'FILLED' if value >= 100.0 else 'not filled'} ({value:.0f}%)")
         except Exception as error:
-            messagebox.showerror("Mana test", str(error))
+            self._show_error("Mana test", str(error))
 
     def stop_automation(self) -> None:
         self._signal_all_workers_stop()
@@ -1783,7 +1855,27 @@ class MacroRecorder:
         try:
             while not self._coordinator_stop.is_set():
                 has_active_session = False
-                for session_id in session_ids:
+                # Re-read the session list each round so the coordinator always
+                # cycles through the current set in stable order.
+                active_ids: list[str] = []
+                for candidate_id in tuple(self._sessions):
+                    candidate = self._sessions.get(candidate_id)
+                    if candidate is None:
+                        continue
+                    candidate_state = candidate.state
+                    if candidate_state["automation_stop"].is_set():
+                        candidate_state["automation_running"] = False
+                    if candidate_state["background_stop"].is_set():
+                        candidate_state["background_running"] = False
+                    if candidate_state["automation_running"] or candidate_state["background_running"]:
+                        active_ids.append(candidate_id)
+
+                if not active_ids:
+                    return
+
+                for active_index, session_id in enumerate(active_ids):
+                    if self._coordinator_stop.is_set():
+                        return
                     session = self._sessions.get(session_id)
                     if session is None:
                         continue
@@ -1797,6 +1889,11 @@ class MacroRecorder:
 
                     has_active_session = True
                     self._run_in_session(session_id, self._run_session_turn)
+
+                    # Pause between sessions so the target app has time to settle.
+                    if active_index < len(active_ids) - 1 and not self._coordinator_stop.is_set():
+                        # Plain Python value cached by start_automation on the UI thread.
+                        self._coordinator_stop.wait(self.session_switch_delay_seconds)
 
                 if not has_active_session:
                     return
@@ -1820,6 +1917,12 @@ class MacroRecorder:
     def _run_session_turn(self) -> None:
         self.session_turn_active = True
         try:
+            # Round-robin scheduling: each session is focused at the beginning
+            # of its turn, then rune-making and its recording loop run before
+            # the coordinator advances to the next session.
+            if self.automation_target_pid is not None and self.automation_target_window_id is not None:
+                self._begin_focused_input(force_focus=True)
+                self._release_focused_input()
             self._check_session_rune()
             if (
                 not self.background_running
@@ -1877,7 +1980,7 @@ class MacroRecorder:
             )
             self.root.after(
                 0,
-                lambda text=error_message: messagebox.showerror("Fishing recording", text),
+                lambda text=error_message: self._show_error("Fishing recording", text),
             )
         finally:
             try:
@@ -1903,7 +2006,7 @@ class MacroRecorder:
                         )
                         self.root.after(
                             0,
-                            lambda text=error_message: messagebox.showerror(
+                            lambda text=error_message: self._show_error(
                                 "Fishing recording", text
                             ),
                         )
@@ -1989,7 +2092,7 @@ class MacroRecorder:
             )
             self.root.after(
                 0,
-                lambda text=error_message: messagebox.showerror("Rune automation", text),
+                lambda text=error_message: self._show_error("Rune automation", text),
             )
 
     def _automation_loop(self) -> None:
@@ -2033,7 +2136,7 @@ class MacroRecorder:
                 session_id,
                 f"Rune automation error; fishing loop continues: {error_message}",
             )
-            self.root.after(0, lambda text=error_message: messagebox.showerror("Rune automation", text))
+            self.root.after(0, lambda text=error_message: self._show_error("Rune automation", text))
         finally:
             self.automation_running = False
             if self.background_stop.is_set():
@@ -2136,7 +2239,7 @@ class MacroRecorder:
             )
             self.root.after(
                 0,
-                lambda text=error_message: messagebox.showerror("Fishing recording", text),
+                lambda text=error_message: self._show_error("Fishing recording", text),
             )
         finally:
             if self.background_held_buttons or self.background_held_keys:
@@ -2344,7 +2447,7 @@ def main(restore_state_path: str | None = None) -> None:
         try:
             recorder.restore_restart_state(restore_state_path)
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
-            messagebox.showerror("Restart restore failed", str(error))
+            recorder._show_error("Restart restore failed", str(error))
     root.mainloop()
 
 
